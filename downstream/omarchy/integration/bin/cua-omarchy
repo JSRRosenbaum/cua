@@ -259,7 +259,8 @@ def input_off():
     if loaded:
         status = input_status()
         if not input_transports_disabled(status):
-            fail("Cua plugin still exposes input after reload; another config loader exists")
+            fail("native Cua input could not be proven disabled after reload; "
+                 "inspect hyprctl -j cua:status and any additional config loaders")
     print("Native Cua input disabled (module remains mapped until logout). "
           "Independent semantic/browser or direct runtimes are not stopped.")
 

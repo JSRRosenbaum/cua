@@ -13,7 +13,7 @@ optdepends=('cua-hyprland-plugin-local: ABI-checked native input'
             'python-yaml: safe Hermes MCP registration')
 source=('bin/cua-omarchy' 'systemd/cua-driver-omarchy.service'
         'hypr/cua-input.lua' 'omarchy/menu-items.json' '../../../LICENSE.md')
-sha256sums=('1f10f74ea3def985ce7a8a7b05223806faca738c6c15053f9ba187d08b08b5fc'
+sha256sums=('404ed7b2d647e16c0d83e94203a629501ab2537c91044f90630e8b2e242e32fb'
             'ca5a82d4c4a9dd385e1055fbf1919f58b277f61691045f077665daecf92b4aa0'
             '052fcfe2cb765ab6f2e01d027df237f6774917fdd81a8723bb011804e2e22e6e'
             'a4bbdfb221b55312a655686ee5eb40f2e612cf812d71f6f3afa108d95a0942bd'
