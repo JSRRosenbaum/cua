@@ -21,6 +21,7 @@ pub fn native_compatibility_mode() -> &'static str {
     hyprland_compatibility::compatibility_mode().as_str()
 }
 pub mod hyprland_input;
+pub(crate) mod hyprland_launch;
 pub mod kwin_helper;
 pub mod overlay;
 pub mod persistent_vptr;

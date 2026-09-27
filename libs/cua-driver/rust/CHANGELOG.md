@@ -5,6 +5,7 @@
 ### Bug Fixes
 
 * **cua-driver:** deliver X11 key-down before the tap delay and finish background keyboard delivery before closing the input connection.
+* **cua-driver/linux (Omarchy fork):** add a paired-Hyprland startup-rule launch route with private environment/PID handoff, 60-second token-scoped admission across splash and main windows, and no replay after an unknown dispatch outcome. Existing-process/URL activation is explicitly outside this prevention route. Private-shell behavior is exercised; native GUI qualification and production activation remain separate gates.
 
 ## [0.29.1](https://github.com/trycua/cua/compare/cua-driver-rs-v0.29.0...cua-driver-rs-v0.29.1) (2026-09-25)
 

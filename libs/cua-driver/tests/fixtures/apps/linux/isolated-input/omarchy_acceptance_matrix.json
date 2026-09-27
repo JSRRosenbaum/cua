@@ -11,6 +11,14 @@
   ],
   "rows": [
     {
+      "id": "native-background-startup-and-cursor-state",
+      "app": "Fresh GTK3 native_capabilities.py Sibling with --startup-splash and a unique app-owned journal; independent Target and Electron primary sentinel",
+      "route": "Driver launch_app through paired compositor hl.exec_cmd_startup_rules; separate idle/positioned cursor-state contract",
+      "action": "Install a test-owned allows_input=true rule, then observe the entire splash-to-main transition under scoped no_initial_focus=true/allows_input=false startup rules; disable the test rule on exit. Query cursor state before first agent input and after a verified native click.",
+      "oracle": "App journal proves both splash map and main readiness; exact PID/native window agrees with compositor; continuous independent focus/cursor and sentinel input remain unchanged across both maps, with fresh snapshots and warp-return negative control. Idle position is null and positioned coordinates are finite.",
+      "negative": "One-shot rules consumed by the splash and ordinary allows_input overrides must not pass. Only token-bearing windows admitted within 60 seconds are covered; existing-process activation and later windows are not certified. Unknown dispatch outcomes must not replay a launch."
+    },
+    {
       "id": "general-native-gtk3",
       "app": "GTK3 native_capabilities.py --actor Target with fresh --journal; separate Sibling process",
       "route": "background native PX, explicit general-native",

@@ -1883,6 +1883,9 @@ fn spawn_launch_command(cmd: &str, additional_arguments: &[String]) -> std::io::
     {
         launch.arg("--force-renderer-accessibility");
     }
+    if crate::wayland::hyprland::is_session() {
+        return crate::wayland::hyprland_launch::spawn(&launch);
+    }
     let child = launch.spawn()?;
     let pid = child.id();
     reap_in_background(child);
@@ -1981,15 +1984,16 @@ impl Tool for LaunchAppTool {
     fn def(&self) -> &ToolDef {
         LAUNCH_DEF.get_or_init(|| ToolDef {
             name: "launch_app".into(),
-            description: "Launch a Linux app. A compositor may activate its new window; the \
-                result reports sampled focus and does not claim background isolation. Provide \
+            description: "Launch a Linux app. On Hyprland, suppress the initial focus of new \
+                exec-token windows for the first 60 seconds; existing-process activation is not \
+                covered. The result reports sampled focus, not universal background isolation. Provide \
                 launch_path (preferred from list_apps), name (direct command or installed desktop \
                 entry), or urls (xdg-open). Resolution precedence: launch_path > name > bundle_id. \
                 Unknown names refuse rather than guessing. Select isolation:owned_session with an \
                 absolute executable to create a separate Xpra display and private Driver socket; \
                 it never adopts existing host windows.".into(),
             input_schema: json!({"type":"object","properties":{
-                "launch_path":{"type":"string","description":"Round-trip the `launch_path` returned by `list_apps` — the Exec= command from the .desktop file with XDG field codes already stripped. Highest precedence on Linux; spawned directly via the system shell."},
+                "launch_path":{"type":"string","description":"Round-trip the launch_path returned by list_apps. Executable and arguments use the installed launcher convention; scoped Hyprland launch preserves the caller's environment and suppresses initial focus of new token-bearing windows."},
                 "name":{"type":"string","description":"App name or command to launch. Tried as a direct command first, then matched against installed .desktop applications (exact display name, desktop-file id, or Exec basename; else an unambiguous display-name substring)."},
                 "bundle_id":{"type":"string","description":"Ignored on Linux (macOS/Windows concept)."},
                 "urls":{"type":"array","items":{"type":"string"},"description":"URLs to open via xdg-open."},
@@ -2133,7 +2137,12 @@ impl Tool for LaunchAppTool {
                                 cmd.to_owned(),
                             ));
                         }
-                        Err(_) => {
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                            ) =>
+                        {
                             // Not an executable on PATH. Resolve the name against
                             // installed XDG .desktop applications — the same
                             // source list_apps reads — and run the match's Exec=.
@@ -2141,13 +2150,11 @@ impl Tool for LaunchAppTool {
                             if let Some(app) = match_installed_app(&installed, cmd) {
                                 let pid =
                                     spawn_launch_command(&app.launch_path, &additional_arguments)
-                                        .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "'{cmd}' matched installed app '{}' but its launcher \
-                                         `{}` failed to start: {e}",
-                                            app.name,
-                                            app.launch_path
-                                        )
+                                        .map_err(|error| {
+                                        anyhow::Error::new(error).context(format!(
+                                            "'{cmd}' matched installed app '{}' with launcher `{}`",
+                                            app.name, app.launch_path
+                                        ))
                                     })?;
                                 return Ok((
                                     format!(
@@ -2183,6 +2190,7 @@ impl Tool for LaunchAppTool {
                                 cmd.to_owned(),
                             ));
                         }
+                        Err(error) => return Err(error.into()),
                     }
                 }
                 unreachable!()
@@ -2219,6 +2227,11 @@ impl Tool for LaunchAppTool {
                         "running": resolved.pid.is_some(),
                         "active": focus_report["active"],
                         "focus": focus_report,
+                        "focus_prevention": if crate::wayland::hyprland::is_session() {
+                            "hyprland_exec_token_startup_rules_60s"
+                        } else {
+                            "unsupported"
+                        },
                         "windows": windows,
                         "launcher_pid": launcher_pid,
                     });
@@ -2266,9 +2279,20 @@ impl Tool for LaunchAppTool {
                         "running": Value::Null,
                         "active": Value::Null,
                         "focus": focus_report,
+                        "focus_prevention": "unsupported_existing_process_or_url_activation",
                         "windows": [],
                     }))
                 }
+            }
+            Ok(Err(e))
+                if e.downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::get_ref)
+                    .is_some_and(|inner| {
+                        inner.is::<crate::wayland::hyprland_launch::LaunchOutcomeUnknown>()
+                    }) =>
+            {
+                ToolResult::error(format!("Launch outcome unknown: {e}"))
+                    .with_structured(json!({"code":"launch_outcome_unknown","effect":"unknown"}))
             }
             Ok(Err(e)) => ToolResult::error(format!("Failed to launch: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),

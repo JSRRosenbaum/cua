@@ -19,6 +19,7 @@ from gi.repository import Gdk, GLib, Gtk
 parser = argparse.ArgumentParser()
 parser.add_argument("--actor", choices=("Source", "Destination", "Target", "Sibling"), required=True)
 parser.add_argument("--journal", required=True)
+parser.add_argument("--startup-splash", action="store_true")
 parser.add_argument("--x", type=int, help="Initial position within an owned X11/Xpra display")
 parser.add_argument("--y", type=int, help="Initial position within an owned X11/Xpra display")
 args = parser.parse_args()
@@ -109,8 +110,26 @@ def key(_widget, event):
 
 window.connect("key-press-event", key)
 window.connect("destroy", Gtk.main_quit)
-window.show_all()
-record("ready", actor=args.actor, backend=Gdk.Display.get_default().__class__.__name__)
+def show_main():
+    window.show_all()
+    record("ready", actor=args.actor, backend=Gdk.Display.get_default().__class__.__name__)
+    return False
+
+
+if args.startup_splash:
+    splash = Gtk.Window(title="Cua Native Capabilities " + args.actor + " Splash")
+    splash.set_default_size(220, 100)
+    splash.add(Gtk.Label(label="Starting native application"))
+    splash.connect("map-event", lambda *_: record("startup-splash-mapped"))
+    splash.show_all()
+
+    def finish_startup():
+        splash.destroy()
+        return show_main()
+
+    GLib.timeout_add(350, finish_startup)
+else:
+    show_main()
 
 
 def heartbeat():

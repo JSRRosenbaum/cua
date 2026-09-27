@@ -52,10 +52,12 @@ fn focus() -> String {
 fn warp(point: (f64, f64)) {
     let output = Command::new("hyprctl")
         .args([
-            "dispatch",
-            "movecursor",
-            &point.0.round().to_string(),
-            &point.1.round().to_string(),
+            "eval",
+            &format!(
+                "hl.dispatch(hl.dsp.cursor.move({{x={}, y={}}}))",
+                point.0.round(),
+                point.1.round()
+            ),
         ])
         .output()
         .expect("independent compositor cursor negative control");
@@ -289,6 +291,10 @@ fn launch(driver: &mut McpDriver, dir: &Path, actor: &str) -> Fixture {
     .expect("launch native GTK3 application fixture");
     let pid = child.id();
     driver.reaper().push(child);
+    native_window(driver, pid, journal, &title)
+}
+
+fn native_window(driver: &mut McpDriver, pid: u32, journal: PathBuf, title: &str) -> Fixture {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let windows = driver.call("list_windows", json!({"pid": pid}));
@@ -297,7 +303,7 @@ fn launch(driver: &mut McpDriver, dir: &Path, actor: &str) -> Fixture {
             .and_then(|windows| {
                 windows.iter().find(|window| {
                     window["pid"].as_u64() == Some(u64::from(pid))
-                        && window["title"].as_str() == Some(title.as_str())
+                        && window["title"].as_str() == Some(title)
                 })
             })
             .and_then(|window| window["window_id"].as_u64())
@@ -309,7 +315,7 @@ fn launch(driver: &mut McpDriver, dir: &Path, actor: &str) -> Fixture {
                 .iter()
                 .find(|client| {
                     client["pid"].as_u64() == Some(u64::from(pid))
-                        && client["title"].as_str() == Some(title.as_str())
+                        && client["title"].as_str() == Some(title)
                 })
                 .expect("independent compositor target identity");
             assert_eq!(client["xwayland"], false, "fixture must use native Wayland");
@@ -448,6 +454,13 @@ fn general_native_px_click_has_application_effect_and_continuous_primary_isolati
         ],
     )
     .expect("candidate Driver required");
+    let idle_cursor = driver.call("get_agent_cursor_state", json!({}));
+    assert!(
+        !idle_cursor.is_error(),
+        "idle cursor state: {}",
+        idle_cursor.text()
+    );
+    assert_eq!(idle_cursor.structured().get("position"), Some(&Value::Null));
     let target = launch(&mut driver, &dir, "Target");
     let sentinel = ForegroundSentinel::launch(&mut driver);
     sentinel
@@ -490,6 +503,142 @@ fn general_native_px_click_has_application_effect_and_continuous_primary_isolati
         1,
         "actual unqualified native app must activate exactly once"
     );
+    let positioned_cursor = driver.call("get_agent_cursor_state", json!({}));
+    assert!(
+        !positioned_cursor.is_error(),
+        "positioned cursor state: {}",
+        positioned_cursor.text()
+    );
+    for axis in ["x", "y"] {
+        assert!(
+            positioned_cursor.structured()["position"][axis]
+                .as_f64()
+                .is_some_and(f64::is_finite),
+            "positioned cursor lacks {axis}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "candidate disposable native Hyprland with bounded startup rules and Electron sentinel"]
+fn native_splash_and_main_launch_preserve_continuous_primary_focus() {
+    preflight();
+    let (dir, _cleanup) = evidence_dir();
+    let mut driver = McpDriver::spawn_named_with_env(
+        "omarchy-native-background-launch",
+        &[
+            ("CUA_DRIVER_PERMISSION_MODE", "standard"),
+            ("CUA_HYPRLAND_COMPATIBILITY_MODE", "general-native"),
+        ],
+    )
+    .expect("candidate Driver required");
+    let target = launch(&mut driver, &dir, "Target");
+    let sentinel = ForegroundSentinel::launch(&mut driver);
+    sentinel
+        .assert_guard_canaries(&mut driver, target.target)
+        .unwrap();
+    driver.start_behavior_recording();
+    sentinel
+        .prepare_background_observation(&mut driver, target.target)
+        .unwrap();
+    warp_return_negative_control(&dir);
+    let _before = snapshot(&mut driver, &target);
+
+    // Exercise precedence against a real existing compositor rule that would
+    // otherwise cancel no_initial_focus. It affects only this owned fixture.
+    struct ExistingInputRule {
+        name: String,
+        active: bool,
+    }
+    impl ExistingInputRule {
+        fn clear(&mut self) -> bool {
+            if !self.active {
+                return true;
+            }
+            self.active = false;
+            let code = format!("if {0} then {0}:set_enabled(false); {0}=nil end", self.name);
+            Command::new("hyprctl")
+                .args(["eval", &code])
+                .output()
+                .is_ok_and(|output| output.status.success() && output.stdout == b"ok\n")
+        }
+    }
+    impl Drop for ExistingInputRule {
+        fn drop(&mut self) {
+            if !self.clear() {
+                eprintln!("owned launch-rule cleanup failed");
+            }
+        }
+    }
+    let mut rule = ExistingInputRule {
+        name: format!("cua_launch_acceptance_{}", std::process::id()),
+        active: true,
+    };
+    let code = format!(
+        "{}=hl.window_rule({{name='cua-launch-acceptance', match={{title='^Cua Native Capabilities Sibling.*$'}}, allows_input=true}})",
+        rule.name
+    );
+    let applied = Command::new("hyprctl")
+        .args(["eval", &code])
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success() && applied.stdout == b"ok\n",
+        "{applied:?}"
+    );
+    let script =
+        workspace_root().join("../tests/fixtures/apps/linux/isolated-input/native_capabilities.py");
+    let journal = dir.join("Sibling.jsonl");
+    let original = cursor();
+    let focused = focus();
+    let watch = PrimarySeatWatch::start(dir.join("launch-primary.json"));
+    let ((result, launched), _) = sentinel.observe_background(target.target, || {
+        let result = driver.call("launch_app", json!({
+            "launch_path": "/usr/bin/python3",
+            "additional_arguments": [script, "--actor", "Sibling", "--journal", journal, "--startup-splash"],
+        }));
+        // A compositor-owned child is not a descendant of the test's daemon.
+        // Adopt only the PID emitted by this nonce-bound application journal,
+        // including failure paths where the Driver cannot attribute a window.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut tracked = false;
+        let pid = loop {
+            if journal.is_file() {
+                let journal_events = events(&journal);
+                if let Some(pid) = journal_events.iter().find_map(|event| event["pid"].as_u64()) {
+                    let pid = u32::try_from(pid).unwrap();
+                    if !tracked {
+                        driver.reaper().track_pid(pid);
+                        tracked = true;
+                    }
+                    if journal_events.iter().any(|event| event["kind"] == "ready") {
+                        break pid;
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "launched fixture never became ready: {}", result.text());
+            thread::sleep(Duration::from_millis(50));
+        };
+        let launched = native_window(
+            &mut driver, pid, journal, "Cua Native Capabilities Sibling",
+        );
+        (result, launched)
+    }).expect("launch must not disturb primary focus, cursor, or sentinel input");
+    let samples = watch.finish();
+    assert_stable(&samples, original, &focused);
+    assert!(!result.is_error(), "native launch: {}", result.text());
+    assert_eq!(
+        result.structured()["pid"].as_u64(),
+        Some(u64::from(launched.target.pid))
+    );
+    assert_eq!(result.structured()["active"], false);
+    let journal = events(&launched.journal);
+    assert!(journal
+        .iter()
+        .any(|event| event["kind"] == "startup-splash-mapped"));
+    assert!(journal.iter().any(|event| event["kind"] == "ready"));
+    let _after = snapshot(&mut driver, &launched);
+    assert!(rule.clear(), "owned launch-rule cleanup failed");
 }
 
 #[test]

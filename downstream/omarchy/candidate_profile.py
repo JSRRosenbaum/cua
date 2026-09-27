@@ -104,6 +104,8 @@ def manifest_source(repo):
     files = tracked_sources(repo)
     manifest = {"schema": 1, "base_revision": git(repo, "rev-parse", "HEAD"),
                 "driver_version": "0.29.1", "files": {name: sha(data) for name, data in sorted(files.items())}}
+    require(re.fullmatch(r"[0-9a-f]{40}", manifest["base_revision"]),
+            "Cua source revision must be a full Git commit SHA")
     return files, manifest
 
 
@@ -527,10 +529,15 @@ def record_driver(kit, driver, output, extracted):
     require(profile["driver_toolchain"] == rust_toolchain(),
             "Driver Rust toolchain changed")
     native_owners = dependency_owners(driver, profile["stock"]["driver_dependencies"])
-    provenance = {"schema": 1, "binary_sha256": digest(driver),
+    driver_bytes = driver.read_bytes()
+    source_revision = profile["source"]["base_revision"]
+    require(source_revision.encode() in driver_bytes,
+            "Driver ELF does not embed reviewed Cua source revision")
+    provenance = {"schema": 1, "binary_sha256": sha(driver_bytes),
                   "profile_sha256": digest(kit / "PROFILE.json"),
                   "source_archive_sha256": profile["source"]["archive_sha256"],
-                  "source_base_revision": profile["source"]["base_revision"],
+                  "source_base_revision": source_revision,
+                  "embedded_source_sha": source_revision,
                   "package_version": profile["source"]["package_version"],
                   "rustc": profile["driver_toolchain"]["rustc"],
                   "cargo": profile["driver_toolchain"]["cargo"],
@@ -580,10 +587,12 @@ def verify_consumer(kit, expected_kit_sha, binary, compositor_binary,
         require(driver is not None and driver_provenance is not None,
                 "Driver binary and provenance must be supplied together")
         driver_build = json.loads(regular(driver_provenance).read_text())
+        driver_bytes = regular(driver).read_bytes()
         require(driver_build["schema"] == 1 and
                 driver_build["profile_sha256"] == provenance["profile_sha256"] and
                 driver_build["source_archive_sha256"] == profile["source"]["archive_sha256"] and
                 driver_build["source_base_revision"] == profile["source"]["base_revision"] and
+                driver_build["embedded_source_sha"] == profile["source"]["base_revision"] and
                 driver_build["package_version"] == profile["source"]["package_version"] and
                 driver_build["rustc"] == profile["driver_toolchain"]["rustc"] and
                 driver_build["cargo"] == profile["driver_toolchain"]["cargo"] and
@@ -595,7 +604,8 @@ def verify_consumer(kit, expected_kit_sha, binary, compositor_binary,
                 driver_build["rustflags"] == profile["driver_toolchain"]["rustflags"] and
                 driver_build["native_dependency_owners"] ==
                 dependency_owners(driver, profile["stock"]["driver_dependencies"]) and
-                digest(regular(driver)) == driver_build["binary_sha256"] and
+                sha(driver_bytes) == driver_build["binary_sha256"] and
+                profile["source"]["base_revision"].encode() in driver_bytes and
                 profile["source"]["driver_version"] in command(str(driver), "--version"),
                 "candidate Driver binary/provenance does not match paired source/profile")
     return profile
@@ -653,6 +663,7 @@ def prepare(args):
         "driver": repo / "downstream/omarchy/driver/PKGBUILD",
     }
     common = {"DRIVER_VERSION": profile["source"]["package_version"],
+              "SOURCE_BASE_REVISION": profile["source"]["base_revision"],
               "SOURCE_SHA256": sha(archive_bytes), "SOURCE_MANIFEST_SHA256": sha(source_bytes),
               "PROFILE_SHA256": sha(profile_bytes), "KIT_SHA256": sha(metadata_bytes),
               "VERIFIER_SHA256": sha(script_bytes)}

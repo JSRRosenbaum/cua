@@ -1,4 +1,4 @@
-//! Read-only Hyprland identity and geometry, adapted from #3052.
+//! Attested Hyprland identity, geometry, and scoped launch handling, adapted from #3052.
 //!
 //! Native IDs are full compositor addresses, never title matches or truncated
 //! protocol object IDs. IPC and capture must belong to the same compositor.
@@ -291,6 +291,43 @@ fn query<T: serde::de::DeserializeOwned>(command: &str) -> Result<T> {
             Ok(ipc)
         },
     )
+}
+
+/// One attested action attempt, never the retrying observation path. Exec rules
+/// apply before the new client's first map; they do not cover D-Bus activation
+/// of an existing process or imply that later activation cannot occur.
+pub(super) fn launch_with_initial_focus_suppressed(command: &str) -> Result<()> {
+    use std::fmt::Write as _;
+    let mut literal = String::with_capacity(command.len() + 2);
+    literal.push('"');
+    for character in command.chars() {
+        match character {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            '\0'..='\u{1f}' | '\u{7f}' => {
+                write!(literal, "\\{:03}", u32::from(character))?;
+            }
+            _ => literal.push(character),
+        }
+    }
+    literal.push('"');
+    let request = format!(
+        "eval hl.exec_cmd_startup_rules({literal}, {{no_initial_focus=true, allows_input=false}})"
+    );
+    let mut ipc = ipc_connection()?;
+    let wayland = wayland_connection()?;
+    if peer_pid(ipc.as_raw_fd())? != peer_pid(wayland.backend().poll_fd().as_raw_fd())? {
+        bail!("Hyprland launch IPC and Wayland name different compositor processes");
+    }
+    let reply = read_reply(&mut ipc, request.as_bytes(), QUERY_TIMEOUT)
+        .context("launch dispatch outcome unknown; do not replay")?;
+    if reply != b"ok" {
+        bail!(
+            "Hyprland scoped launch was not acknowledged; inspect the session before retrying: {}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+    Ok(())
 }
 
 fn query_time_remaining(deadline: Instant) -> Result<Duration> {
