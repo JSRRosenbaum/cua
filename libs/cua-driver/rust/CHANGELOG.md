@@ -6,7 +6,7 @@
 
 * **cua-driver:** deliver X11 key-down before the tap delay and finish background keyboard delivery before closing the input connection.
 * **cua-driver/linux (Omarchy fork):** add a paired-Hyprland startup-rule launch route with private environment/PID handoff, 60-second token-scoped admission across splash and main windows, and no replay after an unknown dispatch outcome. Existing-process/URL activation is explicitly outside this prevention route. Private-shell behavior is exercised; native GUI qualification and production activation remain separate gates.
-* **Omarchy integration:** validate the real plugin's nested v3 keyboard-safety capabilities after enabling the owned flag and reloading configuration. Preserve pre-enable package/module verification and disable-on-failure rollback; disabled transport no longer makes first activation impossible.
+* **Omarchy integration:** validate the real plugin's nested v3 keyboard-safety capabilities after enabling the owned flag and reloading configuration. Require both discovery and native-input transports to be ready, and prove both disabled on shutdown or activation rollback. Preserve pre-enable package/module verification; disabled transport no longer makes first activation impossible.
 
 ## [0.29.1](https://github.com/trycua/cua/compare/cua-driver-rs-v0.29.0...cua-driver-rs-v0.29.1) (2026-09-25)
 

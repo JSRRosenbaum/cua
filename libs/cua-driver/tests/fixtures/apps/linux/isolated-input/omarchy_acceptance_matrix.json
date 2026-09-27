@@ -159,7 +159,7 @@
       "app": "Hardware-isolated private VM with exact paired packages, virtual displays and a real guest user manager; no host graphical service or loop-mounted live disk",
       "route": "one local-only per-user service and explicit agent MCP socket",
       "action": "With validated private Wayland socket+Hyprland PID, launch packaged service and connect two agents; enable input through the owned flag/reload, inspect active nested v3 keyboard capabilities and transport readiness, then revoke/disable and verify flag/socket cleanup; retain unrelated configurations",
-      "oracle": "Attested service MainPID, /proc environment, pidfile, compositor identity and Unix socket match private candidate; active status.input protocol3 and independent-keymap/Num-Lock capabilities pass only after config reload, disabled transport is not falsely treated as a missing build feature; no TCP listener even with inherited CUA_DRIVER_ENVELOPE_HTTP_PORT; source/package hashes and matched rollback set recorded",
+      "oracle": "Attested service MainPID, /proc environment, pidfile, compositor identity and Unix socket match private candidate; active status.input protocol3, independent-keymap/Num-Lock capabilities and input.transport_ready=true pass only after config reload; shutdown/rollback proves both discovery and native transports false, not discovery alone. No TCP listener even with inherited CUA_DRIVER_ENVELOPE_HTTP_PORT; source/package hashes and matched rollback set recorded",
       "negative": "Caller vs user-manager compositor/profile identity mismatch must refuse BEFORE unit mutation; no fallback to physical canonical endpoint or user-home config"
     }
   ]

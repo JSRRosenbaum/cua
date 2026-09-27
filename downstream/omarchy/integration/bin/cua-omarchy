@@ -163,6 +163,18 @@ def require_keyboard_capabilities(status):
              "install the matching patched module and use a fresh login")
 
 
+def input_transports_disabled(status):
+    discovery = status.get("transport")
+    native = status.get("input")
+    native_disabled = (
+        (status.get("state") == "discovery_only" and "input" not in status) or
+        (status.get("state") == "input_v3_candidate" and isinstance(native, dict) and
+         native.get("protocol") == 3 and native.get("transport_ready") is False)
+    )
+    return (status.get("configured") is False and isinstance(discovery, dict) and
+            discovery.get("ready") is False and native_disabled)
+
+
 def owned_flag():
     if FLAG.is_symlink():
         fail(f"{FLAG} is a symlink; refusing to overwrite or remove it")
@@ -211,7 +223,9 @@ def input_on(startup=False):
             fail("could not enable Cua plugin input: " + result.stderr.strip())
         status = input_status()
         require_keyboard_capabilities(status)
-        if status.get("configured") is not True or status.get("transport", {}).get("ready") is not True:
+        if (status.get("configured") is not True or
+                status.get("transport", {}).get("ready") is not True or
+                status["input"].get("transport_ready") is not True):
             fail("Cua input is not ready after activation; inspect hyprctl -j cua:status")
     except (RuntimeError, OSError, subprocess.SubprocessError):
         # A failed startup must not perpetuate its flag or leave native input
@@ -220,7 +234,7 @@ def input_on(startup=False):
             FLAG.unlink()
         if module_loaded():
             stopped = hypr("reload")
-            if stopped.returncode or input_status().get("transport", {}).get("ready") is not False:
+            if stopped.returncode or not input_transports_disabled(input_status()):
                 fail("Cua activation failed and native input could not be proven disabled")
         raise
     print("Native Cua input ready; mapped module matched installed package.")
@@ -244,7 +258,7 @@ def input_off():
         fail("Hyprland reload failed; native input state is unknown: " + result.stderr.strip())
     if loaded:
         status = input_status()
-        if status.get("configured") is not False or status.get("transport", {}).get("ready") is not False:
+        if not input_transports_disabled(status):
             fail("Cua plugin still exposes input after reload; another config loader exists")
     print("Native Cua input disabled (module remains mapped until logout). "
           "Independent semantic/browser or direct runtimes are not stopped.")

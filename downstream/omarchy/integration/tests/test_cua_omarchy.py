@@ -16,6 +16,26 @@ loader.exec_module(control)
 
 
 class OmarchyControlsTest(unittest.TestCase):
+    def test_discovery_shutdown_does_not_prove_native_input_shutdown(self):
+        disabled = {"configured": False, "transport": {"ready": False}}
+        for native in (None, {}, {"protocol": 3, "transport_ready": True},
+                       {"protocol": 4, "transport_ready": False}):
+            with self.subTest(native=native):
+                self.assertFalse(control.input_transports_disabled({
+                    **disabled, "state": "input_v3_candidate", "input": native,
+                }))
+        self.assertFalse(control.input_transports_disabled({
+            **disabled, "state": "input_v3_candidate",
+        }))
+        self.assertTrue(control.input_transports_disabled({
+            **disabled, "state": "input_v3_candidate",
+            "input": {"protocol": 3, "transport_ready": False},
+        }))
+        # Before first activation, no native experiment/resources exist.
+        self.assertTrue(control.input_transports_disabled({
+            **disabled, "state": "discovery_only",
+        }))
+
     def test_ambiguous_public_session_label_cannot_revoke_a_peer(self):
         rows = {"sessions": [
             {"session": "shared", "state": "active", "owner_short_id": "a"},
