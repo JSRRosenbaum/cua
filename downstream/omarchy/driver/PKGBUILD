@@ -1,0 +1,79 @@
+# Rendered from the paired local candidate kit. Builds/stages only; no service hooks.
+# shellcheck shell=bash disable=SC2034,SC2154
+pkgname=cua-driver-omarchy
+pkgver=@DRIVER_VERSION@
+pkgrel=1
+pkgdesc='Exact-source Omarchy Cua Driver fork (no automatic activation)'
+arch=('x86_64')
+url='https://github.com/trycua/cua'
+license=('MIT')
+depends=(@DRIVER_DEPENDS@ 'glibc=@GLIBC_VERSION@' 'libgcc=@LIBGCC_VERSION@')
+makedepends=('gcc' 'pkgconf' 'python' 'rustup')
+optdepends=('xpra: explicit owned Xpra session only'
+            'xorg-server: Xdummy server for explicitly owned Xpra sessions'
+            'xorg-xauth: private Xpra X11 authority'
+            'dbus: private owned-session bus')
+conflicts=('cua-driver-bin')
+options=('!strip' '!debug' '!lto')
+source=('cua-source.tar.gz' 'SOURCE-PROVENANCE.json' 'PROFILE.json'
+        'KIT-PROVENANCE.json' 'profile_verify.py')
+sha256sums=('@SOURCE_SHA256@' '@SOURCE_MANIFEST_SHA256@' '@PROFILE_SHA256@'
+            '@KIT_SHA256@' '@VERIFIER_SHA256@')
+RUSTUP_TOOLCHAIN='@RUSTUP_TOOLCHAIN@'
+RUSTC='@RUSTC_PATH@'
+_reviewed_cargo='@CARGO_PATH@'
+export RUSTUP_TOOLCHAIN RUSTC
+
+_verify() {
+  env -u LD_PRELOAD -u FAKEROOTKEY -u FAKED_MODE \
+    python3 "$startdir/profile_verify.py" verify-build --kit "$startdir" \
+      --extracted "$srcdir/cua-source" --rust || return 1
+}
+
+prepare() {
+  _verify
+  [[ "$("$RUSTC" --version)" == '@RUSTC_VERSION@' &&
+     "$("$_reviewed_cargo" --version)" == '@CARGO_VERSION@' ]] || {
+    printf 'error: reviewed Rust toolchain identity changed\n' >&2
+    return 1
+  }
+}
+
+build() {
+  _verify || return 1
+  [[ ! -e "$srcdir/target" ]] || {
+    printf 'error: retained Cargo target directory is not a fresh reviewed build\n' >&2
+    return 1
+  }
+  CARGO_TARGET_DIR="$srcdir/target" "$_reviewed_cargo" build -j 2 --release --offline --locked \
+    --manifest-path "$srcdir/cua-source/libs/cua-driver/rust/Cargo.toml" \
+    -p cua-driver
+}
+
+check() {
+  "$srcdir/target/release/cua-driver" --version || return 1
+  sha256sum "$srcdir/target/release/cua-driver" > "$srcdir/checked-driver.sha256"
+}
+
+package() {
+  _verify || return 1
+  [[ -f "$srcdir/checked-driver.sha256" ]] || {
+    printf 'error: Driver binary has not passed its invocation check\n' >&2
+    return 1
+  }
+  sha256sum --check "$srcdir/checked-driver.sha256" || return 1
+  env -u LD_PRELOAD -u FAKEROOTKEY -u FAKED_MODE \
+    python3 "$startdir/profile_verify.py" record-driver --kit "$startdir" \
+      --driver "$srcdir/target/release/cua-driver" \
+      --extracted "$srcdir/cua-source" \
+      --output "$srcdir/DRIVER-BUILD-PROVENANCE.json" || return 1
+  install -Dm755 "$srcdir/target/release/cua-driver" "$pkgdir/usr/bin/cua-driver" || return 1
+  install -Dm644 "$srcdir/cua-source/LICENSE.md" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE" || return 1
+  install -Dm644 "$srcdir/DRIVER-BUILD-PROVENANCE.json" \
+    "$pkgdir/usr/share/cua-driver-omarchy/BUILD-PROVENANCE.json" || return 1
+  install -Dm644 "$startdir/SOURCE-PROVENANCE.json" \
+    "$pkgdir/usr/share/cua-driver-omarchy/SOURCE-PROVENANCE.json" || return 1
+  install -Dm644 "$startdir/PROFILE.json" \
+    "$pkgdir/usr/share/cua-driver-omarchy/PROFILE.json"
+}

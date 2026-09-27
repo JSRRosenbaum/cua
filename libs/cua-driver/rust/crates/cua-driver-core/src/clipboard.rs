@@ -20,6 +20,11 @@ pub trait ClipboardBackend: Send + Sync {
     fn write_text(&self, text: String) -> Result<(), String>;
     fn write_image(&self, absolute_path: &str) -> Result<(), String>;
     fn write_file_url(&self, absolute_path: &str) -> Result<(), String>;
+    /// Wayland/X11 selections are offered by the writer process; other OS
+    /// clipboards may persist independently and must not claim that owner.
+    fn selection_owner(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 pub fn register_clipboard_tools(registry: &mut ToolRegistry, backend: Arc<dyn ClipboardBackend>) {
@@ -150,11 +155,11 @@ impl Tool for ClipboardWriteTool {
                 unreachable!("exactly one clipboard value was checked above")
             };
             let types = normalize_types(backend.available_formats()?);
-            Ok::<_, String>((written_type, types))
+            Ok::<_, String>((written_type, types, backend.selection_owner()))
         })
         .await;
 
-        let (written_type, types) = match result {
+        let (written_type, types, selection_owner) = match result {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => return unavailable("write", error),
             Err(error) => return unavailable("write", format!("worker failed: {error}")),
@@ -165,9 +170,11 @@ impl Tool for ClipboardWriteTool {
             types,
             privacy_sensitive: true,
             content_redacted_from_telemetry: true,
+            selection_scope: "desktop_shared".into(),
+            selection_owner: selection_owner.map(str::to_owned),
         };
         ToolResult::text(format!(
-            "Clipboard write succeeded as {written_type}; inspect structuredContent.types before paste."
+            "Clipboard write succeeded as {written_type}; this explicitly replaces the shared desktop selection (not agent-private). Inspect structuredContent.types before paste."
         ))
         .with_structured(serde_json::to_value(output).expect("clipboard output serializes"))
     }
@@ -256,6 +263,10 @@ mod tests {
         assert_eq!(
             write.structured_content.as_ref().unwrap()["types"],
             serde_json::json!(["text/plain"])
+        );
+        assert_eq!(
+            write.structured_content.as_ref().unwrap()["selection_scope"],
+            "desktop_shared"
         );
 
         let read = ClipboardReadTool { backend }

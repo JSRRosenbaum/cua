@@ -1,7 +1,8 @@
 use super::{
     choose_keyboard_cursor_target, cursor_control_scope, named_session_cursor_key,
-    reveal_pointer_action_for, CursorControlScope, ToolState,
+    reveal_pointer_action_for, CursorControlScope, GetAgentCursorStateV2Tool, ToolState,
 };
+use cua_driver_core::tool::Tool;
 use serde_json::json;
 
 #[test]
@@ -78,4 +79,31 @@ async fn pointer_position_survives_an_unavailable_overlay() {
         .expect("pointer action records its position independently of rendering");
     assert!(cursor.config.enabled, "input must revive its agent cursor");
     assert_eq!(cursor.x.zip(cursor.y), Some((123.0, 456.0)));
+}
+
+#[tokio::test]
+async fn cursor_query_preserves_idle_and_independent_positioned_sessions() {
+    let state = ToolState::new();
+    let query = GetAgentCursorStateV2Tool {
+        state: state.clone(),
+    };
+    let idle = query.invoke(json!({"session": "idle"})).await;
+    assert_eq!(
+        idle.structured_content.as_ref().unwrap()["position"],
+        json!(null)
+    );
+
+    state
+        .cursor_registry
+        .update_position("moving", 123.5, -42.0);
+    let moving = query.invoke(json!({"session": "moving"})).await;
+    assert_eq!(
+        moving.structured_content.as_ref().unwrap()["position"],
+        json!({"x":123.5,"y":-42.0})
+    );
+    let idle_again = query.invoke(json!({"session": "idle"})).await;
+    assert_eq!(
+        idle_again.structured_content.as_ref().unwrap()["position"],
+        json!(null)
+    );
 }

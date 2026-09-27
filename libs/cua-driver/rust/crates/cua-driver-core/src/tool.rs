@@ -352,6 +352,10 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
 
         // ── apps / windows ───────────────────────────────────────────
         "launch_app" => &["app.launch"],
+        "stop_owned_session" => &["app.owned_session.stop"],
+        "set_agent_selection" => &["selection.agent_seat.set"],
+        "transfer_data" => &["input.pointer.drag", "data_transfer.native"],
+        "clear_agent_selection" => &["selection.agent_seat.clear"],
         "list_apps" => &["app.list"],
         "kill_app" => &["app.kill"],
         "list_windows" => &["window.list"],
@@ -1909,6 +1913,56 @@ impl ToolRegistry {
         context: &crate::session_authorization::EffectiveAuthorizationContext,
         lifecycle_session: Option<&str>,
     ) -> Result<(), crate::consent::ConsentError> {
+        if tool_name == "transfer_data" {
+            // Transfer authority is the intersection of two independently
+            // attested window grants. No source-only or desktop-wide implicit
+            // grant may authorize an unapproved destination.
+            for prefix in ["source", "destination"] {
+                let pid = args
+                    .get(format!("{prefix}_pid"))
+                    .and_then(Value::as_i64)
+                    .filter(|pid| *pid > 0)
+                    .ok_or_else(|| {
+                        crate::consent::ConsentError::Provider(format!(
+                            "{prefix} transfer pid is required"
+                        ))
+                    })?;
+                let window_id = args
+                    .get(format!("{prefix}_window_id"))
+                    .and_then(Value::as_u64)
+                    .filter(|id| *id > 0)
+                    .ok_or_else(|| {
+                        crate::consent::ConsentError::Provider(format!(
+                            "{prefix} transfer window_id is required"
+                        ))
+                    })?;
+                let projected = serde_json::json!({
+                    "pid":pid,
+                    "window_id":window_id,
+                    "delivery_mode":args.get("delivery_mode").and_then(Value::as_str)
+                        .unwrap_or("background"),
+                });
+                self.authorize_desktop_input_one(
+                    "transfer_data",
+                    &projected,
+                    context,
+                    lifecycle_session,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+        self.authorize_desktop_input_one(tool_name, args, context, lifecycle_session)
+            .await
+    }
+
+    async fn authorize_desktop_input_one(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        context: &crate::session_authorization::EffectiveAuthorizationContext,
+        lifecycle_session: Option<&str>,
+    ) -> Result<(), crate::consent::ConsentError> {
         if context.mode() != crate::authorization::PermissionMode::Bounded
             && context.capability_manifest().is_none()
         {
@@ -2624,6 +2678,7 @@ fn is_physical_desktop_action(tool: &str) -> bool {
             | "right_click"
             | "scroll"
             | "drag"
+            | "transfer_data"
             | "mouse_drag"
             | "parallel_mouse_drag"
             | "move_cursor"
@@ -2644,12 +2699,24 @@ fn requires_desktop_coordination(tool: &str, args: &Value, independent_lane: boo
     }
     // Only an implementation-attested, exact-window background route can
     // leave the shared lane. Explicit desktop and foreground calls never do.
-    let exact_background_window = args["pid"].as_u64().is_some_and(|pid| pid > 0)
-        && args["window_id"].as_u64().is_some_and(|id| id > 0)
-        && args["scope"] != "desktop"
-        && args.pointer("/target/kind").and_then(Value::as_str) != Some("desktop")
-        && args["delivery_mode"] != "foreground"
-        && args["dispatch"] != "foreground";
+    let exact_background_window = if tool == "transfer_data" {
+        // A transfer has two independently authorized endpoints, not the
+        // single pid/window_id fields used by ordinary pointer actions.
+        args["source_pid"].as_u64().is_some_and(|pid| pid > 0)
+            && args["source_window_id"].as_u64().is_some_and(|id| id > 0)
+            && args["destination_pid"].as_u64().is_some_and(|pid| pid > 0)
+            && args["destination_window_id"]
+                .as_u64()
+                .is_some_and(|id| id > 0)
+            && args["delivery_mode"] != "foreground"
+    } else {
+        args["pid"].as_u64().is_some_and(|pid| pid > 0)
+            && args["window_id"].as_u64().is_some_and(|id| id > 0)
+            && args["scope"] != "desktop"
+            && args.pointer("/target/kind").and_then(Value::as_str) != Some("desktop")
+            && args["delivery_mode"] != "foreground"
+            && args["dispatch"] != "foreground"
+    };
     !(independent_lane && exact_background_window)
 }
 
@@ -3787,6 +3854,70 @@ resources:
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn native_transfer_needs_both_independent_window_grants_before_dispatch() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new_with_protected_consent_provider(None);
+        registry.register(Box::new(ObservationProbe {
+            hits: hits.clone(),
+            def: super::ToolDef {
+                name: "transfer_data".into(),
+                description: "test native transfer permission boundary".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: false,
+                destructive: true,
+                idempotent: false,
+                open_world: true,
+            },
+        }));
+        let registry = Arc::new(registry);
+        let args = serde_json::json!({
+            "session":"paired-transfer", "source_pid":42, "source_window_id":7,
+            "destination_pid":43, "destination_window_id":8,
+            "delivery_mode":"background"
+        });
+        let source_only = bounded_context(
+            r#"
+version: 3
+expires_after: 1h
+idle_timeout: 30m
+allow:
+  tools: [transfer_data]
+resources:
+  desktop:
+    windows:
+      - pid: 42
+        window_id: 7
+"#,
+        );
+        let denied = registry
+            .invoke_with_context("transfer_data", args.clone(), source_only)
+            .await;
+        assert_eq!(denied.is_error, Some(true));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        let both = bounded_context(
+            r#"
+version: 3
+expires_after: 1h
+idle_timeout: 30m
+allow:
+  tools: [transfer_data]
+resources:
+  desktop:
+    windows:
+      - pid: 42
+        window_id: 7
+      - pid: 43
+        window_id: 8
+"#,
+        );
+        let allowed = registry
+            .invoke_with_context("transfer_data", args, both)
+            .await;
+        assert_ne!(allowed.is_error, Some(true));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -5213,6 +5344,7 @@ mod capability_tests {
         "get_window_state",
         // app / window
         "launch_app",
+        "stop_owned_session",
         "list_apps",
         "kill_app",
         "list_windows",
@@ -5299,12 +5431,16 @@ mod capability_tests {
         "accessibility.element_tokens",
         // app / window
         "app.launch",
+        "app.owned_session.stop",
         "app.list",
         "app.kill",
         "window.list",
         "window.activate",
         "window.frame.set",
         "window.debug_info",
+        "selection.agent_seat.set",
+        "selection.agent_seat.clear",
+        "data_transfer.native",
         // permissions
         "system.permissions.tcc",
         "system.permissions.tcc.accessibility",

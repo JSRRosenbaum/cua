@@ -15,7 +15,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use atspi::connection::AccessibilityConnection;
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::proxy_ext::ProxyExt;
@@ -2732,7 +2732,7 @@ async fn write_through_editable_proxies(
         Ok(tp) => tp.caret_offset().await.unwrap_or(0),
         Err(_) => 0,
     };
-    let len = text.chars().count() as i32;
+    let len = i32::try_from(text.len()).context("AT-SPI insertion exceeds i32 UTF-8 bytes")?;
 
     if et.insert_text(off, text, len).await.unwrap_or(false) {
         return Ok(true);
@@ -3740,6 +3740,109 @@ pub fn type_into_editable_ref(object_ref: &ObjectRef, text: &str) -> Result<()> 
         },
         || Err(anyhow!("type_into_editable (cached element) timed out")),
     )
+}
+
+fn semantic_insert_length(text: &str) -> Result<i32> {
+    ensure!(
+        !text.is_empty() && text.len() <= 4096 && !text.contains('\0'),
+        "semantic text requires 1..=4096 UTF-8 bytes without NUL"
+    );
+    Ok(text.len() as i32)
+}
+
+/// An exact, focus-free semantic insert into the accessible observed beneath
+/// `frame_ref`. This path intentionally makes one EditableText call only: an
+/// unanswered call may already have edited the application, so retrying,
+/// replacing the contents, or switching to keyboard input could duplicate it.
+pub fn insert_text_bound_ref(
+    object_ref: &ObjectRef,
+    frame_ref: &ObjectRef,
+    text: &str,
+) -> Result<()> {
+    let byte_length = semantic_insert_length(text)?;
+    ensure!(
+        object_ref.bus.starts_with(':') && frame_ref.bus.starts_with(':'),
+        "semantic text requires unique AT-SPI bus owners"
+    );
+    bounded_for(
+        REF_ACTION_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            let (acc, _) = live_accessible(conn, object_ref).await?;
+            // The bus object can outlive (or move out of) the window that was
+            // captured. Recheck its live parent chain before touching it.
+            let mut current = raw_ref(object_ref);
+            let frame = raw_ref(frame_ref);
+            let mut owners = std::collections::HashMap::new();
+            let mut within_frame = current == frame;
+            for _ in 0..64 {
+                if within_frame {
+                    break;
+                }
+                let parent_acc = accessible_for(conn, &current).await?;
+                let parent = call(parent_acc.parent())
+                    .await
+                    .ok_or_else(|| anyhow!("AT-SPI parent lookup timed out"))??;
+                let raw = RawObjectRef::from_atspi(&parent)
+                    .ok_or_else(|| anyhow!("AT-SPI parent has no address"))?;
+                let next = identity_ref(conn, &raw, &mut owners)
+                    .await
+                    .ok_or_else(|| anyhow!("AT-SPI parent owner is unavailable"))?;
+                ensure!(next != current, "AT-SPI parent chain is cyclic");
+                within_frame = next == frame;
+                current = next;
+            }
+            ensure!(
+                within_frame,
+                "editable no longer belongs to the observed window"
+            );
+            let ifaces = call(acc.get_interfaces())
+                .await
+                .ok_or_else(|| anyhow!("EditableText interface check timed out"))??;
+            ensure!(
+                ifaces.contains(Interface::EditableText) && ifaces.contains(Interface::Text),
+                "the exact target does not expose EditableText and Text"
+            );
+            let proxies = acc.proxies().await?;
+            let text_proxy = proxies.text().await?;
+            let caret = call(text_proxy.caret_offset())
+                .await
+                .ok_or_else(|| anyhow!("editable caret lookup timed out"))??;
+            ensure!(caret >= 0, "editable has no known caret");
+            // The length argument counts UTF-8 bytes, not Unicode scalar
+            // values (AT-SPI EditableText.insert_text contract).
+            let editable = proxies.editable_text().await?;
+            let accepted = call(editable.insert_text(caret, text, byte_length))
+                .await
+                .ok_or_else(|| {
+                    anyhow!("EditableText insertion reply timed out; delivery unknown")
+                })??;
+            ensure!(
+                accepted,
+                "EditableText insertion was rejected; delivery unknown"
+            );
+            Ok(())
+        },
+        || {
+            Err(anyhow!(
+                "EditableText insertion deadline expired; delivery unknown"
+            ))
+        },
+    )
+}
+
+#[cfg(test)]
+mod semantic_text_tests {
+    use super::semantic_insert_length;
+
+    #[test]
+    fn unicode_insertion_uses_utf8_byte_length_and_rejects_unrepresentable_payloads() {
+        assert_eq!(semantic_insert_length("漢🙂e\u{301}").unwrap(), 10);
+        assert_eq!(semantic_insert_length(&"é".repeat(2048)).unwrap(), 4096);
+        assert!(semantic_insert_length(&"é".repeat(2049)).is_err());
+        assert!(semantic_insert_length("a\0b").is_err());
+        assert!(semantic_insert_length("").is_err());
+    }
 }
 
 /// Write `text` into the focused widget known from the focus-event log, if it

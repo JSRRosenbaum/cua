@@ -21,6 +21,9 @@ pub mod tools;
 pub mod x11;
 
 #[cfg(target_os = "linux")]
+pub mod owned_xpra;
+
+#[cfg(target_os = "linux")]
 pub mod input;
 
 #[cfg(target_os = "linux")]

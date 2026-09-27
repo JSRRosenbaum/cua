@@ -1,0 +1,22 @@
+[Unit]
+Description=Cua Driver for this Omarchy graphical session
+Documentation=https://github.com/omacom/omarchy/pull/11342
+After=graphical-session.target
+BindsTo=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
+
+[Service]
+Type=simple
+RuntimeDirectory=cua-driver-omarchy
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=restart
+Environment=CUA_DRIVER_RS_ENABLE_WAYLAND=1
+Environment=CUA_DRIVER_PERMISSION_MODE=standard
+UnsetEnvironment=CUA_DRIVER_RS_MCP_HTTP_PORT CUA_DRIVER_RS_MCP_HTTP_TOKEN CUA_DRIVER_ENVELOPE_HTTP_PORT CUA_DRIVER_ENVELOPE_PERMISSION_MODE CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS CUA_DRIVER_EMBEDDED
+ExecStart=/usr/bin/cua-omarchy serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

@@ -18,6 +18,8 @@ use std::sync::{Arc, RwLock};
 
 use crate::atspi::ElementCache;
 use cursor_overlay::CursorRegistry;
+mod seat_selection;
+mod transfer;
 
 fn window_target_candidates_for_pid(
     windows: impl IntoIterator<Item = crate::x11::WindowInfo>,
@@ -1313,7 +1315,12 @@ impl Tool for GetWindowStateTool {
                 window_overlays(pid, xid)
             };
             let screenshot = if should_capture {
-                let captured = if overlays.covers_window {
+                let captured = if crate::wayland::is_wayland()
+                    && crate::wayland::hyprland::is_session()
+                {
+                    crate::wayland::hyprland::capture_with_geometry(xid, Some(pid))
+                        .map(|(png, window, frame, scene)| (png, Some((window, frame, scene))))
+                } else if overlays.covers_window {
                     overlays
                         .window_rect
                         .ok_or_else(|| anyhow::anyhow!("window geometry unavailable"))
@@ -1321,11 +1328,13 @@ impl Tool for GetWindowStateTool {
                             crate::capture::screenshot_root_region_png(x, y, w, h)
                         })
                         .or_else(|_| crate::wayland::screenshot_dispatch_with_pid(xid, pid))
+                        .map(|png| (png, None))
                 } else {
                     crate::wayland::screenshot_dispatch_with_pid(xid, pid)
+                        .map(|png| (png, None))
                 };
                 match captured {
-                    Ok(raw) => {
+                    Ok((raw, geometry)) => {
                         let (orig_w, orig_h) = crate::capture::png_dimensions_pub(&raw)?;
                         let png = crate::capture::resize_png_if_needed(&raw, max_dim)?;
                         let (w, h) = crate::capture::png_dimensions_pub(&png)?;
@@ -1352,15 +1361,18 @@ impl Tool for GetWindowStateTool {
                         let capture_id = if observation_only {
                             None
                         } else {
-                            Some(crate::capture_action_frame::publish_window(
-                                &state_for_capture.capture_service,
-                                &args,
-                                &png,
-                                pid,
-                                xid,
-                                (w, h),
-                                (orig_w, orig_h),
-                            )?)
+                            Some(match geometry {
+                                Some((window, frame, scene)) => {
+                                    crate::capture_action_frame::publish_window_with_geometry(
+                                        &state_for_capture.capture_service, &args, &png, pid, xid,
+                                        (w, h), (orig_w, orig_h), window, frame, scene,
+                                    )?
+                                }
+                                None => crate::capture_action_frame::publish_window(
+                                    &state_for_capture.capture_service, &args, &png, pid, xid,
+                                    (w, h), (orig_w, orig_h),
+                                )?,
+                            })
                         };
                         Some((b64, file_path, w, h, original_w, capture_id))
                     }
@@ -1756,9 +1768,89 @@ mod get_window_state_actions_tests;
 pub struct LaunchAppTool;
 static LAUNCH_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+fn admitted_owned_session(
+    args: &Value,
+) -> Result<(String, cua_driver_core::session::SessionDispatchGuard), ToolResult> {
+    use cua_driver_core::session;
+    let owner = args
+        .get("_session_id")
+        .and_then(Value::as_str)
+        .filter(|owner| !owner.is_empty())
+        .ok_or_else(|| ToolResult::error("Owned session requires an authenticated session"))?;
+    let transport = args
+        .get("_transport_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or(owner);
+    let snapshot = session::session_snapshot(owner, transport, std::time::Duration::ZERO)
+        .ok_or_else(|| ToolResult::error("Owned session requires an admitted lifecycle"))?;
+    let guard = session::begin_session_dispatch(
+        owner,
+        snapshot.public_label.as_deref(),
+        transport,
+        snapshot.implicit,
+        snapshot.transport,
+        snapshot.client_kind,
+    )
+    .map_err(ToolResult::error)?;
+    Ok((owner.to_owned(), guard))
+}
+
+fn owned_launch_command(
+    command: &str,
+    extra: &[String],
+) -> Result<(String, Vec<String>), &'static str> {
+    if command.is_empty() || !std::path::Path::new(command).is_absolute() {
+        return Err("owned session requires an absolute executable path; no shell or PATH lookup");
+    }
+    Ok((command.to_owned(), extra.to_vec()))
+}
+
+/// Fresh compositor/X11 focus observation. PID is authoritative on Hyprland;
+/// X11 exposes only its active XID through the existing adapter.
+fn observe_launch_focus() -> Result<Option<(u64, u32)>, String> {
+    if crate::wayland::hyprland::is_session() {
+        crate::wayland::hyprland::active_window_identity().map_err(|error| error.to_string())
+    } else if crate::wayland::is_wayland() {
+        Err("this Wayland compositor has no exact active-window observation adapter".into())
+    } else {
+        Ok(crate::x11::active_window().map(|xid| (xid, 0)))
+    }
+}
+
+/// An endpoint sample cannot prove that no transient focus theft occurred.
+/// In particular, restoring the previous focus is not background launch.
+fn launch_focus_report(
+    before: &Result<Option<(u64, u32)>, String>,
+    after: &Result<Option<(u64, u32)>, String>,
+    windows: &[crate::x11::WindowInfo],
+) -> Value {
+    let identity = |observation: &Result<Option<(u64, u32)>, String>| match observation {
+        Ok(Some((window_id, pid))) => json!({"window_id":window_id,"pid":pid}),
+        Ok(None) => Value::Null,
+        Err(_) => Value::Null,
+    };
+    let active = after.as_ref().ok().and_then(|focus| {
+        (!windows.is_empty()).then(|| {
+            focus.is_some_and(|(address, pid)| {
+                windows
+                    .iter()
+                    .any(|window| window.xid == address && (pid == 0 || window.pid == Some(pid)))
+            })
+        })
+    });
+    json!({
+        "active": active,
+        "focus_before": identity(before),
+        "focus_after": identity(after),
+        "focus_changed_at_samples": before.as_ref().ok().zip(after.as_ref().ok()).map(|(a,b)| a != b),
+        "focus_observation_error": before.as_ref().err().or_else(|| after.as_ref().err()),
+        "transient_focus_changes": "not_monitored"
+    })
+}
+
 /// Spawn a launcher command line (an executable plus arguments, e.g. an XDG
-/// `Exec=` value with field codes stripped) in the background and return the
-/// child pid.
+/// `Exec=` value with field codes stripped). Detach stdio and return the child
+/// pid. A spawn alone does not establish background focus isolation.
 fn spawn_launch_command(cmd: &str, additional_arguments: &[String]) -> std::io::Result<u32> {
     let mut parts = cmd.split_whitespace();
     let prog = parts.next().unwrap_or(cmd);
@@ -1778,7 +1870,12 @@ fn spawn_launch_command(cmd: &str, additional_arguments: &[String]) -> std::io::
         // ScreenReaderEnabled setting (which can launch Orca). Native
         // toolkits ignore these when they do not need them.
         .env("ACCESSIBILITY_ENABLED", "1")
-        .env("NO_AT_BRIDGE", "0");
+        .env("NO_AT_BRIDGE", "0")
+        // Never forward an activation token obtained by the Driver itself to
+        // an unrelated app. Hyprland may still focus new windows by its own
+        // policy; the returned focus observation reports that separately.
+        .env_remove("XDG_ACTIVATION_TOKEN")
+        .env_remove("DESKTOP_STARTUP_ID");
     if chromium_family_program(prog)
         && !rest
             .iter()
@@ -1884,18 +1981,20 @@ impl Tool for LaunchAppTool {
     fn def(&self) -> &ToolDef {
         LAUNCH_DEF.get_or_init(|| ToolDef {
             name: "launch_app".into(),
-            description: "Launch a Linux app in the background. Provide launch_path (preferred — \
-                round-trip the value from list_apps), name (tried as a direct command, then \
-                matched against installed .desktop applications, then handed to xdg-open if it \
-                is a URL or existing file path), bundle_id (ignored on Linux), or urls (list of \
-                URLs to open). Resolution precedence: launch_path > name > bundle_id. Errors \
-                when the name resolves to nothing launchable.".into(),
+            description: "Launch a Linux app. A compositor may activate its new window; the \
+                result reports sampled focus and does not claim background isolation. Provide \
+                launch_path (preferred from list_apps), name (direct command or installed desktop \
+                entry), or urls (xdg-open). Resolution precedence: launch_path > name > bundle_id. \
+                Unknown names refuse rather than guessing. Select isolation:owned_session with an \
+                absolute executable to create a separate Xpra display and private Driver socket; \
+                it never adopts existing host windows.".into(),
             input_schema: json!({"type":"object","properties":{
                 "launch_path":{"type":"string","description":"Round-trip the `launch_path` returned by `list_apps` — the Exec= command from the .desktop file with XDG field codes already stripped. Highest precedence on Linux; spawned directly via the system shell."},
                 "name":{"type":"string","description":"App name or command to launch. Tried as a direct command first, then matched against installed .desktop applications (exact display name, desktop-file id, or Exec basename; else an unambiguous display-name substring)."},
                 "bundle_id":{"type":"string","description":"Ignored on Linux (macOS/Windows concept)."},
                 "urls":{"type":"array","items":{"type":"string"},"description":"URLs to open via xdg-open."},
-                "additional_arguments":{"type":"array","items":{"type":"string"},"description":"Extra command-line arguments passed to the launched process."}
+                "additional_arguments":{"type":"array","items":{"type":"string"},"description":"Extra command-line arguments passed to the launched process."},
+                "isolation":{"type":"string","enum":["shared_desktop","owned_session"],"default":"shared_desktop","description":"owned_session explicitly starts a new app on a private Xpra display and returns a private MCP socket. It never moves an existing window."}
             },"additionalProperties":false}),
             read_only: false, destructive: false, idempotent: false, open_world: true,
         })
@@ -1927,6 +2026,63 @@ impl Tool for LaunchAppTool {
         if launch_path_opt.is_none() && name_opt.is_none() && urls.is_empty() {
             return ToolResult::error("Provide at least one of: launch_path, name, or urls.");
         }
+        match args.get("isolation").and_then(Value::as_str) {
+            Some("owned_session") => {
+                if !urls.is_empty() {
+                    return ToolResult::error(
+                        "Owned session requires an executable, not xdg-open URLs.",
+                    );
+                }
+                let Some(command) = launch_path_opt.as_deref().or(name_opt.as_deref()) else {
+                    return ToolResult::error(
+                        "Owned session requires an absolute launch_path or name.",
+                    );
+                };
+                let (program, arguments) =
+                    match owned_launch_command(command, &additional_arguments) {
+                        Ok(value) => value,
+                        Err(reason) => return ToolResult::error(reason),
+                    };
+                let (owner, lifecycle) = match admitted_owned_session(&args) {
+                    Ok(value) => value,
+                    Err(refusal) => return refusal,
+                };
+                let driver = match std::env::current_exe() {
+                    Ok(driver) => driver,
+                    Err(error) => {
+                        return ToolResult::error(format!(
+                            "Cannot locate Driver executable: {error}"
+                        ))
+                    }
+                };
+                let launched = tokio::task::spawn_blocking(move || {
+                    let _lifecycle = lifecycle;
+                    crate::owned_xpra::launch(&owner, &program, &arguments, &driver)
+                })
+                .await;
+                return match launched {
+                    Ok(Ok(info)) => ToolResult::text(
+                        "Launched a new application in an explicitly owned Xpra session; connect to its private MCP socket to control it. No host window was adopted."
+                    )
+                    .with_structured(json!({
+                        "pid":info.child_pid,"started":true,"running":Value::Null,"active":Value::Null,
+                        "host_active":false,"windows":[],
+                        "isolation":"owned_session","effect":"unverifiable",
+                        "owned_session":{
+                            "id":info.id,"socket":info.socket,"display":info.display
+                        }
+                    })),
+                    Ok(Err(error)) => ToolResult::error(format!("Owned session launch failed: {error}"))
+                        .with_structured(json!({"code":"owned_session_unavailable","effect":"refused"})),
+                    Err(error) => ToolResult::error(format!(
+                        "Owned session worker failed; inspect sessions before retrying: {error}"
+                    ))
+                    .with_structured(json!({"code":"owned_session_launch_unknown","effect":"unknown"})),
+                };
+            }
+            None | Some("shared_desktop") => {}
+            Some(_) => return ToolResult::error("Unknown isolation mode."),
+        }
 
         // Snapshot the top-levels before spawning so a window created by an
         // already-running service (D-Bus activation) can be told apart.
@@ -1937,6 +2093,9 @@ impl Tool for LaunchAppTool {
                 .into_iter()
                 .map(|w| w.xid)
                 .collect();
+        let focus_before = tokio::task::spawn_blocking(observe_launch_focus)
+            .await
+            .unwrap_or_else(|error| Err(format!("focus observation task failed: {error}")));
         let result = tokio::task::spawn_blocking(
             move || -> anyhow::Result<(String, Option<u32>, String)> {
                 // Open URLs via xdg-open.
@@ -1967,7 +2126,9 @@ impl Tool for LaunchAppTool {
                     match spawn_launch_command(cmd, &additional_arguments) {
                         Ok(pid) => {
                             return Ok((
-                                format!("✅ Launched {cmd} (pid {pid}) in background."),
+                                format!(
+                                    "Launched {cmd} (pid {pid}); checking window and focus state."
+                                ),
                                 Some(pid),
                                 cmd.to_owned(),
                             ));
@@ -1990,8 +2151,8 @@ impl Tool for LaunchAppTool {
                                     })?;
                                 return Ok((
                                     format!(
-                                        "✅ Launched {} (`{}`, pid {pid}) in background — \
-                                         resolved '{cmd}' via its desktop entry.",
+                                        "Launched {} (`{}`, pid {pid}), resolved '{cmd}' via its \
+                                         desktop entry; checking window and focus state.",
                                         app.name, app.launch_path
                                     ),
                                     Some(pid),
@@ -2043,13 +2204,21 @@ impl Tool for LaunchAppTool {
                     .unwrap_or_else(|_| LaunchedWindows::default());
                     let windows: Vec<Value> =
                         resolved.windows.iter().map(window_record_json).collect();
+                    let focus_after = tokio::task::spawn_blocking(observe_launch_focus)
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(format!("focus observation task failed: {error}"))
+                        });
+                    let focus_report =
+                        launch_focus_report(&focus_before, &focus_after, &resolved.windows);
                     let mut text = message;
                     let mut structured = json!({
                         "pid": resolved.pid,
                         "bundle_id": Value::Null,
                         "name": name,
                         "running": resolved.pid.is_some(),
-                        "active": false,
+                        "active": focus_report["active"],
+                        "focus": focus_report,
                         "windows": windows,
                         "launcher_pid": launcher_pid,
                     });
@@ -2078,20 +2247,69 @@ impl Tool for LaunchAppTool {
                             }
                         }
                     }
+                    text.push_str(" Focus is sampled before and after launch; transient activation may have occurred even when the samples match.");
                     ToolResult::text(text).with_structured(structured)
                 } else {
-                    ToolResult::text(message).with_structured(json!({
+                    let focus_after = tokio::task::spawn_blocking(observe_launch_focus)
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(format!("focus observation task failed: {error}"))
+                        });
+                    let focus_report = launch_focus_report(&focus_before, &focus_after, &[]);
+                    ToolResult::text(format!(
+                        "{message} Focus was sampled but the opened URL/file has no attributable window; activation may have occurred."
+                    ))
+                    .with_structured(json!({
                         "pid": Value::Null,
                         "bundle_id": Value::Null,
                         "name": name,
                         "running": Value::Null,
-                        "active": false,
+                        "active": Value::Null,
+                        "focus": focus_report,
                         "windows": [],
                     }))
                 }
             }
             Ok(Err(e)) => ToolResult::error(format!("Failed to launch: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
+        }
+    }
+}
+
+/// Stop only an owned Xpra instance created by the same authenticated agent
+/// session. This never unloads a host plugin or terminates a host application.
+pub struct StopOwnedSessionTool;
+static STOP_OWNED_SESSION_DEF: std::sync::LazyLock<ToolDef> = std::sync::LazyLock::new(|| {
+    ToolDef {
+    name: "stop_owned_session".into(),
+    description: "Stop an explicitly owned Xpra session by its launch_app owned_session.id. Only its original authenticated agent session can stop it; host windows are untouched.".into(),
+    input_schema: json!({"type":"object","required":["id"],"properties":{
+        "id":{"type":"string","minLength":1},
+        "session":cua_driver_core::tool_schema::session_schema()
+    },"additionalProperties":false}),
+    read_only:false, destructive:true, idempotent:false, open_world:false,
+}
+});
+
+#[async_trait]
+impl Tool for StopOwnedSessionTool {
+    fn def(&self) -> &ToolDef {
+        &STOP_OWNED_SESSION_DEF
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let Some(id) = args.get("id").and_then(Value::as_str) else {
+            return ToolResult::error("Owned session id is required.");
+        };
+        let (owner, _lifecycle) = match admitted_owned_session(&args) {
+            Ok(value) => value,
+            Err(refusal) => return refusal,
+        };
+        match crate::owned_xpra::stop(id, &owner) {
+            Ok(()) => ToolResult::text("Stopped only the requested owned Xpra session.")
+                .with_structured(json!({"id":id,"stopped":true,"scope":"owned_session"})),
+            Err(error) => ToolResult::error(format!("Owned session stop refused: {error}"))
+                .with_structured(json!({"code":"owned_session_not_owned","effect":"refused"})),
         }
     }
 }
@@ -2420,11 +2638,44 @@ fn desktop_frame_requested(args: &Value) -> bool {
         || args.get("scope").and_then(Value::as_str) == Some("desktop")
 }
 
-/// Convert desktop (screen) coordinates to `xid`'s window-local frame so the
-/// rest of the pointer pipeline (which is window-local by contract) is reused.
+/// Convert a desktop screenshot-frame point into compositor-global logical
+/// coordinates. Hyprland's frame can start at a negative origin and include
+/// powered-output gaps; never round or clamp a point into another output.
+fn desktop_frame_to_layout_point(x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
+    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+        crate::wayland::hyprland::frame_point_to_layout(x, y)
+    } else {
+        anyhow::ensure!(
+            x.is_finite() && y.is_finite(),
+            "desktop point must be finite"
+        );
+        Ok((x, y))
+    }
+}
+
+fn desktop_dispatch_point(x: f64, y: f64) -> anyhow::Result<(i32, i32)> {
+    let (x, y) = desktop_frame_to_layout_point(x, y)?;
+    anyhow::ensure!(
+        x >= f64::from(i32::MIN)
+            && x < f64::from(i32::MAX)
+            && y >= f64::from(i32::MIN)
+            && y < f64::from(i32::MAX),
+        "desktop point exceeds the compositor coordinate range"
+    );
+    Ok((x.floor() as i32, y.floor() as i32))
+}
+
+/// A named window uses window-local logical coordinates even if the observed
+/// point came from a full desktop capture.
 fn desktop_to_window_local(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
+    let (sx, sy) = desktop_frame_to_layout_point(x, y)?;
+    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+        let window = crate::wayland::hyprland::window_for_address(xid)
+            .ok_or_else(|| anyhow::anyhow!("exact desktop target window disappeared"))?;
+        return Ok((sx - f64::from(window.x), sy - f64::from(window.y)));
+    }
     let (ox, oy) = window_local_to_screen(xid, 0.0, 0.0)?;
-    Ok((x - ox, y - oy))
+    Ok((sx - ox, sy - oy))
 }
 
 /// Upper bound for one foreground input transaction: focus confirmation plus
@@ -4418,12 +4669,212 @@ fn spawn_isolated_hyprland(
     Ok((guard, dispatch))
 }
 
+fn xwayland_local_point(x: f64, y: f64) -> Option<(i32, i32)> {
+    (x.is_finite()
+        && y.is_finite()
+        && x >= 0.0
+        && y >= 0.0
+        && x < f64::from(i32::MAX)
+        && y < f64::from(i32::MAX))
+    .then(|| (x.floor() as i32, y.floor() as i32))
+}
+
+enum XWaylandCall {
+    Pointer(crate::input::XWaylandBackgroundPointer),
+    Key { key: String, modifiers: Vec<String> },
+}
+
+/// The public window_id remains a compositor CWindow address. Translate it to
+/// an XID only in the validated XWayland actuator immediately before delivery.
+/// No native-seat target, MPX, uinput or global XTest fallback is permitted.
+async fn xwayland_hyprland_action_if_target(
+    args: &Value,
+    pid: u32,
+    address: u64,
+    action: &crate::wayland::hyprland_input::Action,
+    foreground: bool,
+    addressed_element: bool,
+) -> Option<ToolResult> {
+    use crate::wayland::hyprland::TargetKind;
+    let target =
+        tokio::task::spawn_blocking(move || crate::wayland::hyprland::target_kind(pid, address))
+            .await;
+    match target {
+        Ok(Ok(TargetKind::Native)) => return None,
+        Ok(Ok(TargetKind::XWayland)) => {}
+        Ok(Err(error))
+            if error
+                .downcast_ref::<crate::wayland::hyprland::TargetAbsent>()
+                .is_some() =>
+        {
+            let detail =
+                format!("exact Hyprland target pid {pid}, window {address:x} is unmapped or gone");
+            return Some(
+                ToolResult::error(format!("stale_target: {detail}")).with_structured(json!({
+                    "ok":false,"code":"stale_target","reason":"stale_target",
+                    "detail":detail,"effect":"refused","verified":false,
+                    "route":if foreground { "global_input" } else { "synthetic_events" }
+                })),
+            );
+        }
+        Ok(Err(error)) => {
+            return Some(if foreground {
+                foreground_hyprland_refusal(format!(
+                    "exact Hyprland target identity unavailable: {error}"
+                ))
+            } else {
+                isolated_hyprland_refusal(format!(
+                    "exact Hyprland target identity unavailable: {error}"
+                ))
+            })
+        }
+        Err(error) => {
+            return Some(if foreground {
+                foreground_hyprland_refusal(format!("target identity observation failed: {error}"))
+            } else {
+                isolated_hyprland_refusal(format!("target identity observation failed: {error}"))
+            })
+        }
+    }
+    if foreground {
+        let owner = named_session_cursor_key(args);
+        let action = action.clone();
+        let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
+            let xid = crate::wayland::hyprland_input::inspect_xwayland(pid, address)?;
+            crate::wayland::hyprland_input::execute_xwayland_foreground(
+                owner,
+                pid,
+                address,
+                xid,
+                action,
+                cancellation,
+            )
+        }) {
+            Ok(dispatch) => dispatch,
+            Err(_) => {
+                return Some(foreground_hyprland_refusal(
+                    "authenticated admitted lifecycle required",
+                ))
+            }
+        };
+        return Some(hyprland_input_result(
+            match dispatch.await {
+                Ok(result) => result,
+                Err(error) => Err(crate::wayland::hyprland_input::unknown_dispatch(
+                    error.into(),
+                    0,
+                )),
+            },
+            true,
+        ));
+    }
+    if addressed_element {
+        return Some(isolated_hyprland_refusal(
+            "XWayland scroll requires exact window-local x/y, not an element index",
+        ));
+    }
+    let call = match action {
+        crate::wayland::hyprland_input::Action::Click { x, y, button, count } => {
+            let Some((x, y)) = xwayland_local_point(*x, *y) else {
+                return Some(isolated_hyprland_refusal("XWayland click point is invalid"));
+            };
+            let Ok(button) = u8::try_from(*button) else {
+                return Some(isolated_hyprland_refusal("XWayland button is invalid"));
+            };
+            XWaylandCall::Pointer(crate::input::XWaylandBackgroundPointer::Click {
+                x, y, button, count: *count,
+            })
+        }
+        crate::wayland::hyprland_input::Action::Scroll { point, direction, amount } => {
+            if !(1..=20).contains(amount) {
+                return Some(isolated_hyprland_refusal("XWayland wheel ticks must be 1..=20"));
+            }
+            let point = point.or_else(|| {
+                crate::wayland::hyprland::window_for_address(address)
+                    .filter(|window| window.pid == pid)
+                    .map(|window| (f64::from(window.width) / 2.0, f64::from(window.height) / 2.0))
+            });
+            let Some((x, y)) = point.and_then(|(x, y)| xwayland_local_point(x, y)) else {
+                return Some(isolated_hyprland_refusal("XWayland scroll point is unavailable"));
+            };
+            let button = match direction.as_str() {
+                "up" => 4, "down" => 5, "left" => 6, "right" => 7,
+                _ => return Some(isolated_hyprland_refusal("XWayland scroll direction is invalid")),
+            };
+            XWaylandCall::Pointer(crate::input::XWaylandBackgroundPointer::Scroll {
+                x, y, button, ticks: *amount,
+            })
+        }
+        crate::wayland::hyprland_input::Action::Key { key, modifiers } => {
+            XWaylandCall::Key { key: key.clone(), modifiers: modifiers.clone() }
+        }
+        _ => return Some(isolated_hyprland_refusal(
+            "XWayland has no validated background route for this operation; launch a new app in an explicitly owned session",
+        )),
+    };
+    let (_cancel_guard, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
+        cancellation.check()?;
+        match call {
+            XWaylandCall::Pointer(pointer) => {
+                crate::input::send_xwayland_background_pointer(pid, address, pointer)?
+            }
+            XWaylandCall::Key { key, modifiers } => {
+                let refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                crate::input::send_xwayland_background_key(pid, address, None, &key, &refs)?
+            }
+        }
+        Ok(json!({"ok":true}))
+    }) {
+        Ok(dispatch) => dispatch,
+        Err(refusal) => return Some(refusal),
+    };
+    Some(match dispatch.await {
+        Ok(Ok(_)) => {
+            let record = cua_driver_core::action_record::ActionExecutionRecord::builder(
+                cua_driver_core::action_record::ActionEffect::Unverifiable,
+                cua_driver_core::action_record::ActionTransport::LinuxXSendEvent,
+                cua_driver_core::action_record::RequestedDelivery::Background,
+            )
+            .actual_delivery(cua_driver_core::action_record::ActualDelivery::Background)
+            .build()
+            .expect("XWayland background record is valid");
+            ToolResult::text(
+                "Sent exact-XID XWayland synthetic input; application effect is unverified.",
+            )
+            .with_structured(json!({
+                "route":"xwayland_xsend_event","effect":"unverifiable",
+                "verified":false,"delivery_mode":"background"
+            }))
+            .with_action_record(record)
+        }
+        Ok(Err(error)) => ToolResult::error(format!(
+            "XWayland input may have been sent; inspect the app before retrying: {error}"
+        ))
+        .with_structured(json!({
+            "code":"xwayland_delivery_unknown","effect":"unknown",
+            "delivery":{"mode":"unknown"},"route":"xwayland_xsend_event"
+        })),
+        Err(error) => ToolResult::error(format!(
+            "XWayland worker failed; input delivery is unknown: {error}"
+        ))
+        .with_structured(json!({
+            "code":"xwayland_delivery_unknown","effect":"unknown",
+            "delivery":{"mode":"unknown"},"route":"xwayland_xsend_event"
+        })),
+    })
+}
+
 async fn isolated_hyprland_action(
     args: &Value,
     pid: u32,
     xid: u64,
     action: crate::wayland::hyprland_input::Action,
 ) -> ToolResult {
+    if let Some(result) =
+        xwayland_hyprland_action_if_target(args, pid, xid, &action, false, false).await
+    {
+        return result;
+    }
     let owner = named_session_cursor_key(args);
     let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
         crate::wayland::hyprland_input::execute(owner, pid, xid, action, cancellation)
@@ -4454,6 +4905,11 @@ async fn foreground_hyprland_action(
 ) -> ToolResult {
     if !crate::wayland::hyprland_input::enabled() {
         return foreground_hyprland_refusal("production Hyprland input plugin is unavailable");
+    }
+    if let Some(result) =
+        xwayland_hyprland_action_if_target(args, pid, xid, &action, true, false).await
+    {
+        return result;
     }
     let owner = named_session_cursor_key(args);
     let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
@@ -4579,71 +5035,6 @@ async fn isolated_worker_retains_lifecycle_until_native_work_exits() {
     release.send(()).unwrap();
     dispatch.await.unwrap().unwrap();
     assert!(session::is_session_ended(sid));
-}
-
-#[cfg(test)]
-#[test]
-fn isolated_background_routes_do_not_reprobe_availability_before_primary_fallback() {
-    // Structural regression for the availability-loss race: each tool keeps
-    // the decision that bypassed background refusal until its returning
-    // native branch. A second probe here could select primary-seat input.
-    let source = include_str!("impl_.rs");
-    for (start, end) in [
-        ("impl Tool for ClickTool {", "impl Tool for TypeTextTool {"),
-        (
-            "impl Tool for ScrollTool {",
-            "impl Tool for DoubleClickTool {",
-        ),
-        (
-            "impl Tool for DragTool {",
-            "impl Tool for MouseButtonDownTool {",
-        ),
-    ] {
-        let body = source
-            .rsplit_once(start)
-            .unwrap()
-            .1
-            .split_once(end)
-            .unwrap()
-            .0;
-        let invoke = body.split_once("async fn invoke").unwrap().1;
-        assert_eq!(
-            invoke
-                .matches("isolated_hyprland_background(delivery)")
-                .count(),
-            1,
-            "{start}"
-        );
-        let native = invoke.split_once("if isolated_background {").unwrap().1;
-        assert!(native.contains("return match dispatch.await"), "{start}");
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn type_text_routes_isolated_background_before_generic_wayland_refusal() {
-    let source = include_str!("impl_.rs");
-    let invoke = source
-        .rsplit_once("impl Tool for TypeTextTool {")
-        .unwrap()
-        .1
-        .split_once("impl Tool for PressKeyTool {")
-        .unwrap()
-        .0
-        .split_once("async fn invoke")
-        .unwrap()
-        .1;
-    let isolated = invoke
-        .find("isolated_hyprland_background(delivery)")
-        .expect("type_text must select isolated Hyprland background delivery");
-    let generic = invoke
-        .find("unavailable_wayland_focused_input_background")
-        .expect("type_text must retain the generic Wayland refusal");
-    assert!(
-        isolated < generic,
-        "the plugin route must run before the generic focused-input refusal"
-    );
-    assert!(invoke.contains("execute_background_text"));
 }
 
 #[cfg(test)]
@@ -6084,7 +6475,7 @@ impl Tool for ClickTool {
                     "element_index": cua_driver_core::tool_schema::element_index_schema(),
                     "element_token": cua_driver_core::tool_schema::element_token_schema(),
                     "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
-                    "capture_id":{"type":"string","description":"Optional one-shot binding to the exact PNG returned by get_window_state or get_desktop_state. When present, x/y are interpreted in that capture and admitted before native dispatch."},
+                    "capture_id":{"type":"string","description":"One-shot binding to the exact PNG from get_window_state (window-local x/y, including an off-workspace toplevel) or get_desktop_state (coordinate_frame:\"desktop\" plus exact pid/window_id). Native window exports retain the captured root and child hit through isolated dispatch; XWayland window exports require explicit foreground control with their captured XID/root. Popups absent from a window export require the visible desktop frame. Changed scene identity refuses without a live-target fallback."},
                     // Shape matches the shared button_schema() canon (string +
                     // [left,right,middle]); kept inline to carry the Linux/Wayland
                     // back-compat prose the click button-schema test asserts on.
@@ -6140,22 +6531,47 @@ impl Tool for ClickTool {
                 return ToolResult::error("click.count must be at least 1.")
                     .with_structured(json!({ "code": "invalid_arguments" }));
             }
-            let (action_x, action_y) = if let Some(capture_id) = args.opt_str("capture_id") {
-                match crate::capture_action_frame::admit_desktop_click(
+            let frame_point = if let Some(capture_id) = args.opt_str("capture_id") {
+                let admission = match crate::capture_action_frame::admit_desktop_click(
                     &self.state.capture_service,
                     &args,
                     &capture_id,
                     input.x,
                     input.y,
                 ) {
-                    Ok(point) => point,
+                    Ok(admission) => admission,
                     Err(error) => return capture_admission_error(error),
+                };
+                if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                    match admission.popup_target() {
+                        Ok(Some((pid, window_id))) => {
+                            return ToolResult::error(format!(
+                                "Captured popup belongs to pid {pid}, window {window_id}; \
+                                 use the exact named window and capture_id with \
+                                 coordinate_frame:\"desktop\" for isolated input"
+                            ))
+                            .with_structured(json!({
+                                "code":"captured_popup_requires_exact_target","effect":"refused",
+                                "pid":pid,"window_id":window_id
+                            }));
+                        }
+                        Ok(None) => {}
+                        Err(error) => return capture_admission_error(error),
+                    }
                 }
+                admission.frame_point
             } else {
                 (input.x, input.y)
             };
-            let sx = action_x.round() as i32;
-            let sy = action_y.round() as i32;
+            let (sx, sy) = match desktop_dispatch_point(frame_point.0, frame_point.1) {
+                Ok(point) => point,
+                Err(error) => {
+                    return ToolResult::error(format!("Desktop click refused: {error}"))
+                        .with_structured(
+                            json!({"code":"invalid_desktop_point","effect":"refused"}),
+                        )
+                }
+            };
             // Glide the agent-cursor overlay to the click point first (the macOS
             // / Windows desktop paths already do this). Without it the overlay
             // sits idle elsewhere while only the real pointer warps, so a viewer
@@ -6632,34 +7048,53 @@ impl Tool for ClickTool {
             )
             .with_structured(json!({ "code": "invalid_arguments" }));
         }
-        if capture_id_arg.is_some() && desktop_frame {
-            return ToolResult::error(
-                "click.capture_id cannot be combined with desktop-frame coordinates; use coordinates from the published capture.",
-            )
-            .with_structured(json!({ "code": "invalid_arguments" }));
-        }
         let native_refusal = (!isolated_background)
             .then(|| unavailable_wayland_focused_input_background(delivery, true))
             .flatten();
+        let mut window_capture_proof = None;
+        let frame_admission = if desktop_frame {
+            if let Some(capture_id) = capture_id_arg.as_deref() {
+                match crate::capture_action_frame::admit_desktop_click(
+                    &self.state.capture_service,
+                    &args,
+                    capture_id,
+                    x,
+                    y,
+                ) {
+                    Ok(admission) => Some(admission),
+                    Err(error) => return capture_admission_error(error),
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if desktop_frame {
             // Desktop pixels: no zoom/screenshot scaling; translated once below.
             if let Some(refusal) = native_refusal {
                 return refusal;
             }
-        } else if let Some(capture_id) = capture_id_arg {
+            if let Some(admission) = &frame_admission {
+                (x, y) = admission.frame_point;
+            }
+        } else if let Some(capture_id) = capture_id_arg.as_deref() {
             if let Some(refusal) = native_refusal {
                 return refusal;
             }
             match crate::capture_action_frame::admit_window_click(
                 &self.state.capture_service,
                 &args,
-                &capture_id,
+                capture_id,
                 pid,
                 xid,
                 x,
                 y,
             ) {
-                Ok(point) => (x, y) = point,
+                Ok(admission) => {
+                    (x, y) = admission.point;
+                    window_capture_proof = admission.proof;
+                }
                 Err(error) => return capture_admission_error(error),
             }
         } else {
@@ -6684,6 +7119,158 @@ impl Tool for ClickTool {
                     x *= scale;
                     y *= scale;
                 }
+            }
+        }
+        // A window-local PNG is an export of this toplevel's root/subsurface
+        // tree, including off-workspace windows. It is not a desktop topmost
+        // hit. Retain that captured identity all the way to the native plugin:
+        // ordinary TARGET (or an AT-SPI shortcut) would rebind a live scene.
+        if crate::wayland::is_wayland()
+            && crate::wayland::hyprland::is_session()
+            && capture_id_arg.is_some()
+            && !desktop_frame
+        {
+            let Some(proof) = window_capture_proof else {
+                return capture_admission_error(
+                    cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch
+                        .into(),
+                );
+            };
+            let point = (x, y);
+            let owner = named_session_cursor_key(&args);
+            let action = crate::wayland::hyprland_input::Action::Click {
+                x,
+                y,
+                button: u32::from(button),
+                count,
+            };
+            if proof.xid.is_some() {
+                if !hyprland_foreground(delivery) {
+                    return isolated_hyprland_refusal(
+                        "XWayland window capture has no isolated seat route; \
+                         request explicit foreground control",
+                    );
+                }
+                if !modifiers.is_empty() {
+                    return foreground_hyprland_refusal(
+                        "modified XWayland window capture clicks are unsupported",
+                    );
+                }
+                let (_cancellation, dispatch) =
+                    match spawn_isolated_hyprland(&args, move |cancellation| {
+                        crate::wayland::hyprland_input::execute_xwayland_capture_foreground(
+                            owner,
+                            pid,
+                            xid,
+                            action,
+                            point,
+                            proof,
+                            cancellation,
+                        )
+                    }) {
+                        Ok(dispatch) => dispatch,
+                        Err(_) => {
+                            return foreground_hyprland_refusal(
+                                "authenticated admitted lifecycle required",
+                            )
+                        }
+                    };
+                return hyprland_input_result(
+                    match dispatch.await {
+                        Ok(result) => result,
+                        Err(error) => Err(crate::wayland::hyprland_input::unknown_dispatch(
+                            error.into(),
+                            0,
+                        )),
+                    },
+                    true,
+                );
+            }
+            if !isolated_background {
+                return foreground_hyprland_refusal(
+                    "native window capture input requires an exact background window action; \
+                     foreground capture-bound input is unavailable",
+                );
+            }
+            if !modifiers.is_empty() {
+                return isolated_hyprland_refusal("modified window capture clicks are unsupported");
+            }
+            let (_cancellation, dispatch) =
+                match spawn_isolated_hyprland(&args, move |cancellation| {
+                    crate::wayland::hyprland_input::execute_window_capture(
+                        owner,
+                        pid,
+                        xid,
+                        action,
+                        point,
+                        proof,
+                        cancellation,
+                    )
+                }) {
+                    Ok(dispatch) => dispatch,
+                    Err(refusal) => return refusal,
+                };
+            return match dispatch.await {
+                Ok(result) => isolated_hyprland_result(result),
+                Err(error) => isolated_hyprland_task_error(error, false),
+            };
+        }
+        if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+            if let Some(admission) = frame_admission {
+                if !isolated_background {
+                    return foreground_hyprland_refusal(
+                        "captured native popup input requires an exact background window action; \
+                         foreground FRAME_TARGET is unavailable",
+                    );
+                }
+                if !modifiers.is_empty() {
+                    return isolated_hyprland_refusal(
+                        "modified captured-frame clicks are unsupported",
+                    );
+                }
+                match crate::wayland::hyprland::target_kind(pid, xid) {
+                    Ok(crate::wayland::hyprland::TargetKind::Native) => {}
+                    Ok(crate::wayland::hyprland::TargetKind::XWayland) => {
+                        return isolated_hyprland_refusal(
+                            "XWayland captured popup has no native isolated seat route; \
+                             request explicit foreground control",
+                        )
+                    }
+                    Err(error) => return isolated_hyprland_refusal(error.to_string()),
+                }
+                let hit = match admission.frame_hit(pid, xid) {
+                    Ok(hit) => hit,
+                    Err(error) => return capture_admission_error(error),
+                };
+                let point = match admission.local_point(&hit) {
+                    Ok(point) => point,
+                    Err(error) => return capture_admission_error(error),
+                };
+                let owner = named_session_cursor_key(&args);
+                let (_cancellation, dispatch) =
+                    match spawn_isolated_hyprland(&args, move |cancellation| {
+                        crate::wayland::hyprland_input::execute_frame(
+                            owner,
+                            pid,
+                            xid,
+                            crate::wayland::hyprland_input::Action::Click {
+                                x: point.0,
+                                y: point.1,
+                                button: u32::from(button),
+                                count,
+                            },
+                            point,
+                            hit,
+                            cancellation,
+                        )
+                    }) {
+                        Ok(dispatch) => dispatch,
+                        Err(refusal) => return refusal,
+                    };
+                return match dispatch.await {
+                    Ok(result) => isolated_hyprland_result(result),
+                    Err(error) => isolated_hyprland_task_error(error, false),
+                };
             }
         }
         if desktop_frame {
@@ -6758,6 +7345,25 @@ impl Tool for ClickTool {
                 return isolated_hyprland_refusal(
                     "modified clicks are unsupported by isolated input",
                 );
+            }
+            // Classify before the semantic shortcut: an XWayland address is
+            // never a native-seat target and its public ID is not an XID.
+            if let Some(result) = xwayland_hyprland_action_if_target(
+                &args,
+                pid,
+                xid,
+                &crate::wayland::hyprland_input::Action::Click {
+                    x,
+                    y,
+                    button: u32::from(button),
+                    count,
+                },
+                false,
+                false,
+            )
+            .await
+            {
+                return result;
             }
             if button == 1 && count == 1 {
                 let semantic = tokio::task::spawn_blocking(move || {
@@ -7086,6 +7692,119 @@ async fn focus_nested_inject_target(
 pub struct TypeTextTool {
     state: Arc<ToolState>,
 }
+async fn dispatch_seat_composition(args: &Value, text: &str, mode: &str) -> ToolResult {
+    if !matches!(mode, "preedit" | "commit") {
+        return isolated_hyprland_refusal("composition_mode must be preedit or commit");
+    }
+    if text.len() > 900 || text.contains('\0') {
+        return isolated_hyprland_refusal(
+            "seat text must contain at most 900 UTF-8 bytes without NUL",
+        );
+    }
+    if mode == "commit" && text.is_empty() {
+        return isolated_hyprland_refusal("seat text commit must not be empty");
+    }
+    if args.get("scope").and_then(Value::as_str) == Some("desktop")
+        || coordinate_frame_is_desktop(args)
+        || args.get("x").is_some()
+        || args.get("y").is_some()
+        || args.get("element_index").is_some()
+        || args.get("element_token").is_some()
+        || args.get("snapshot_id").is_some()
+    {
+        return isolated_hyprland_refusal(
+            "seat composition requires only an exact native pid and window_id, not desktop/pixel/element focus",
+        );
+    }
+    let delivery = crate::input::delivery::DeliveryMode::from_args(args);
+    if !isolated_hyprland_background(delivery) {
+        return isolated_hyprland_refusal(
+            "seat composition requires background delivery on the isolated Hyprland agent seat",
+        );
+    }
+    let Some(pid) = args
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value != 0)
+    else {
+        return isolated_hyprland_refusal("seat composition requires an exact nonzero pid");
+    };
+    let Some(address) = args
+        .get("window_id")
+        .and_then(Value::as_u64)
+        .filter(|value| *value != 0)
+    else {
+        return isolated_hyprland_refusal("seat composition requires an exact nonzero window_id");
+    };
+    if mode == "commit" && (args.get("cursor_begin").is_some() || args.get("cursor_end").is_some())
+    {
+        return isolated_hyprland_refusal("commit has no preedit cursor offsets");
+    }
+    let default_cursor = text.len() as i32;
+    let begin = args
+        .get("cursor_begin")
+        .and_then(Value::as_i64)
+        .unwrap_or(i64::from(default_cursor));
+    let end = args
+        .get("cursor_end")
+        .and_then(Value::as_i64)
+        .unwrap_or(i64::from(default_cursor));
+    let (Ok(begin), Ok(end)) = (i32::try_from(begin), i32::try_from(end)) else {
+        return isolated_hyprland_refusal("preedit cursors must be UTF-8 byte offsets");
+    };
+    if mode == "preedit"
+        && (![begin, end]
+            .into_iter()
+            .all(|offset| offset == -1 || (offset >= 0 && text.is_char_boundary(offset as usize))))
+    {
+        return isolated_hyprland_refusal(
+            "preedit cursors must be -1 (hidden) or UTF-8 byte boundaries",
+        );
+    }
+    let owner = named_session_cursor_key(args);
+    let text = text.to_owned();
+    let preedit = mode == "preedit";
+    let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
+        if preedit {
+            crate::wayland::hyprland_input::execute_preedit(
+                owner,
+                pid,
+                address,
+                &text,
+                begin,
+                end,
+                cancellation,
+            )
+        } else {
+            crate::wayland::hyprland_input::execute_semantic_text_commit(
+                owner,
+                pid,
+                address,
+                &text,
+                cancellation,
+            )
+        }
+    }) {
+        Ok(dispatch) => dispatch,
+        Err(refusal) => return refusal,
+    };
+    let result = match dispatch.await {
+        Ok(result) => isolated_hyprland_result(result),
+        Err(error) => isolated_hyprland_task_error(error, false),
+    };
+    if result.is_error == Some(true) {
+        result
+    } else {
+        result.with_structured(json!({
+            "native_route":"seat_text_input",
+            "composition_mode":mode,
+            "effect":"unverifiable",
+            "verified":false
+        }))
+    }
+}
+
 static TYPE_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 #[async_trait]
@@ -7107,6 +7826,9 @@ impl Tool for TypeTextTool {
                     "y":{"type":"number","description":"Pixel Y of the field (see x)."},
                     "scope":{"type":"string","enum":["window","desktop"],"default":"window"},
                     "coordinate_frame": coordinate_frame_schema(),
+                    "composition_mode":{"type":"string","enum":["preedit","commit"],"description":"Native Hyprland agent-seat text-input, exact pid/window_id and background only. Preedit updates composition without committing; commit inserts text and clears preedit."},
+                    "cursor_begin":{"type":"integer","minimum":-1,"maximum":900,"description":"Preedit cursor begin as UTF-8 byte offset; -1 hides it, otherwise defaults to text byte length."},
+                    "cursor_end":{"type":"integer","minimum":-1,"maximum":900,"description":"Preedit cursor end as UTF-8 byte offset; -1 hides it, otherwise defaults to text byte length."},
                     "delivery_mode": crate::input::delivery::delivery_mode_schema()
                 },"additionalProperties":false
             }),
@@ -7116,6 +7838,17 @@ impl Tool for TypeTextTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        if args.get("composition_mode").is_none()
+            && (args.get("cursor_begin").is_some() || args.get("cursor_end").is_some())
+        {
+            return isolated_hyprland_refusal("preedit cursor offsets require composition_mode");
+        }
+        if args.get("composition_mode").is_some()
+            && (args.opt_str("scope").as_deref() == Some("desktop")
+                || coordinate_frame_is_desktop(&args))
+        {
+            return isolated_hyprland_refusal("seat composition cannot use desktop physical input");
+        }
         if (args.opt_str("scope").as_deref() == Some("desktop")
             || coordinate_frame_is_desktop(&args))
             && args.get("pid").is_none()
@@ -7153,6 +7886,9 @@ impl Tool for TypeTextTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        if let Some(mode) = args.get("composition_mode").and_then(Value::as_str) {
+            return dispatch_seat_composition(&args, &text_raw, mode).await;
+        }
         // Strip trailing agent-protocol closing tags — see
         // cua_driver_core::text_sanitize docs for rationale.
         let text = cua_driver_core::text_sanitize::strip_trailing_agent_protocol_tags(&text_raw)
@@ -7232,6 +7968,97 @@ impl Tool for TypeTextTool {
         };
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
         if isolated_hyprland_background(delivery)
+            && args.get("x").is_none()
+            && args.get("y").is_none()
+            && !is_chromium_embedder(pid)
+            && !is_webkitgtk_embedder(pid)
+        {
+            if let cua_driver_core::element_token::ResolvedElement::Element {
+                element_index,
+                element,
+                ..
+            } = &resolved
+            {
+                let Some(window_id) = xid_opt else {
+                    return isolated_hyprland_refusal(
+                        "semantic text requires an exact window-scoped snapshot",
+                    );
+                };
+                let idx = *element_index;
+                let expected = element.identity.clone();
+                let text_ax = text.clone();
+                let owner = named_session_cursor_key(&args);
+                // Exact compositor seat/client admission and the addressed
+                // AT-SPI identity are both held across the one semantic call.
+                // A failed D-Bus reply may follow a successful insertion;
+                // never replay it as physical keys or through a different seat.
+                let (_cancellation, dispatch) =
+                    match spawn_isolated_hyprland(&args, move |cancellation| {
+                        crate::wayland::hyprland_input::with_semantic_target(
+                            owner,
+                            pid,
+                            window_id,
+                            cancellation,
+                            || {
+                                crate::atspi::type_into_editable_in(
+                                    pid, window_id, idx, &expected, &text_ax,
+                                )?;
+                                Ok(json!({"ok":true}))
+                            },
+                        )
+                    }) {
+                        Ok(dispatch) => dispatch,
+                        Err(refusal) => return refusal,
+                    };
+                return match dispatch.await {
+                    Ok(Ok(_)) => ToolResult::text(
+                        "Sent target-bound semantic text via AT-SPI; application effect requires independent verification.",
+                    )
+                    .with_structured(json!({
+                        "route":"semantic_text",
+                        "delivery_mode":"background",
+                        "effect":"unverifiable",
+                        "verified":false,
+                        "character_count":text.chars().count()
+                    }))
+                    .with_action_record(
+                        cua_driver_core::action_record::ActionExecutionRecord::builder(
+                            cua_driver_core::action_record::ActionEffect::Unverifiable,
+                            cua_driver_core::action_record::ActionTransport::LinuxAtSpiValue,
+                            cua_driver_core::action_record::RequestedDelivery::Background,
+                        )
+                        .actual_delivery(cua_driver_core::action_record::ActualDelivery::Background)
+                        .build()
+                        .expect("target-bound semantic text record is valid"),
+                    ),
+                    Ok(Err(error))
+                        if error.is::<crate::wayland::hyprland_input::SemanticTargetUnavailable>()
+                            || error.is::<crate::atspi::SemanticTargetUnavailable>() =>
+                    {
+                        ToolResult::error(format!("Exact semantic target unavailable: {error}"))
+                            .with_structured(json!({
+                                "code":"semantic_target_unavailable","effect":"refused",
+                                "route":"semantic_text","verified":false
+                            }))
+                    }
+                    Ok(Err(error)) => ToolResult::error(format!(
+                        "Semantic text delivery is unknown; do not replay without inspecting the target: {error}"
+                    ))
+                    .with_structured(json!({
+                        "code":"semantic_delivery_unknown","effect":"unknown",
+                        "route":"semantic_text","verified":false
+                    })),
+                    Err(error) => ToolResult::error(format!(
+                        "Semantic text worker failed; delivery is unknown and must not be replayed: {error}"
+                    ))
+                    .with_structured(json!({
+                        "code":"semantic_delivery_unknown","effect":"unknown",
+                        "route":"semantic_text","verified":false
+                    })),
+                };
+            }
+        }
+        if isolated_hyprland_background(delivery)
             && resolved_elem_idx.is_none()
             && args.get("x").is_none()
             && args.get("y").is_none()
@@ -7292,24 +8119,91 @@ impl Tool for TypeTextTool {
             if xid_opt.is_none() {
                 return foreground_hyprland_refusal("an exact window_id is required");
             }
-            // Native editables retain their verifiable, addressed AT-SPI route.
-            if !is_chromium_embedder(pid) && !is_webkitgtk_embedder(pid) {
-                if let Some(index) = resolved_elem_idx {
-                    let text_ax = text.clone();
-                    if matches!(
-                        tokio::task::spawn_blocking(move || crate::atspi::type_into_editable_at(
-                            pid, index, &text_ax
-                        ))
-                        .await,
-                        Ok(Ok(()))
-                    ) {
-                        return type_text_ax_result(
-                            pid,
-                            text.chars().count(),
-                            "via targeted AT-SPI",
-                        );
-                    }
+            // An addressed accessibility write is a separate semantic route.
+            // It must name the exact cached object and never retry as physical
+            // keys after a lost or negative D-Bus acknowledgement.
+            if let cua_driver_core::element_token::ResolvedElement::Element {
+                element_index,
+                element,
+                ..
+            } = &resolved
+            {
+                let index = *element_index;
+                let expected = element.identity.clone();
+                let text_ax = text.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::atspi::type_into_editable_in(pid, xid, index, &expected, &text_ax)
+                })
+                .await;
+                return match result {
+                    Ok(Ok(())) => type_text_ax_result(
+                        pid, text.chars().count(), "via exact targeted AT-SPI",
+                    ),
+                    Ok(Err(error)) if error.is::<crate::atspi::SemanticTargetUnavailable>() =>
+                        ToolResult::error(format!("Exact semantic target unavailable: {error}"))
+                            .with_structured(json!({
+                                "code":"semantic_target_unavailable","effect":"refused",
+                                "route":"semantic_text","verified":false
+                            })),
+                    Ok(Err(error)) => ToolResult::error(format!(
+                        "Semantic text delivery is unknown; inspect the target before retrying: {error}"
+                    )).with_structured(json!({
+                        "code":"semantic_delivery_unknown","effect":"unknown",
+                        "route":"semantic_text","verified":false
+                    })),
+                    Err(error) => ToolResult::error(format!(
+                        "Semantic text worker failed; delivery is unknown: {error}"
+                    )).with_structured(json!({
+                        "code":"semantic_delivery_unknown","effect":"unknown",
+                        "route":"semantic_text","verified":false
+                    })),
+                };
+            }
+            let target_kind = match crate::wayland::hyprland::target_kind(pid, xid) {
+                Ok(kind) => kind,
+                Err(error) => {
+                    return foreground_hyprland_refusal(format!(
+                        "exact text target identity unavailable: {error}"
+                    ))
                 }
+            };
+            if target_kind == crate::wayland::hyprland::TargetKind::XWayland {
+                if px.zip(py).is_some() {
+                    return foreground_hyprland_refusal(
+                        "XWayland foreground text requires an already focused exact target; pixel pre-focus is unavailable"
+                    );
+                }
+                let owner = named_session_cursor_key(&args);
+                let (_cancellation, dispatch) =
+                    match spawn_isolated_hyprland(&args, move |cancellation| {
+                        let xwindow_id =
+                            crate::wayland::hyprland_input::inspect_xwayland(pid, xid)?;
+                        crate::wayland::hyprland_input::execute_xwayland_foreground_text(
+                            owner,
+                            pid,
+                            xid,
+                            xwindow_id,
+                            &text,
+                            cancellation,
+                        )
+                    }) {
+                        Ok(dispatch) => dispatch,
+                        Err(_) => {
+                            return foreground_hyprland_refusal(
+                                "authenticated admitted lifecycle required",
+                            )
+                        }
+                    };
+                return hyprland_input_result(
+                    match dispatch.await {
+                        Ok(result) => result,
+                        Err(error) => Err(crate::wayland::hyprland_input::unknown_dispatch(
+                            error.into(),
+                            0,
+                        )),
+                    },
+                    true,
+                );
             }
             match crate::wayland::hyprland_input::text_actions(&text) {
                 Ok(actions) if !actions.is_empty() => {}
@@ -9215,6 +10109,7 @@ impl Tool for ScrollTool {
                     "element_index": cua_driver_core::tool_schema::element_index_schema(),
                     "element_token": cua_driver_core::tool_schema::element_token_schema(),
                     "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
+                    "capture_id":{"type":"string","description":"Capture handle from get_window_state or get_desktop_state. The exact screenshot and target geometry are checked before dispatch."},
                     "x":{"type":"number","description":"Window-local screenshot-pixel X of the scroll target. Pass with y and without element_index."},
                     "y":{"type":"number","description":"Window-local screenshot-pixel Y of the scroll target. Pass with x and without element_index."},
                     "scope":{"type":"string","enum":["window","desktop"],"default":"window"},
@@ -9237,9 +10132,40 @@ impl Tool for ScrollTool {
                 Err(result) => return result,
             };
             let direction = input.direction.as_str().to_owned();
-            let (x, y) = (input.x, input.y);
-            let x = x.round() as i32;
-            let y = y.round() as i32;
+            let (screen_x, screen_y) = if let Some(id) =
+                args.get("capture_id").and_then(Value::as_str)
+            {
+                let admitted = match crate::capture_action_frame::admit_desktop_click(
+                    &self.state.capture_service,
+                    &args,
+                    id,
+                    input.x,
+                    input.y,
+                ) {
+                    Ok(admitted) => admitted,
+                    Err(error) => return capture_admission_error(error),
+                };
+                if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                    match admitted.popup_target() {
+                        Ok(Some(_)) => return ToolResult::error("Captured popup scroll requires an exact named target")
+                            .with_structured(json!({"code":"captured_popup_requires_exact_target","effect":"refused"})),
+                        Ok(None) => {}
+                        Err(error) => return capture_admission_error(error),
+                    }
+                }
+                admitted.frame_point
+            } else {
+                (input.x, input.y)
+            };
+            let (x, y) = match desktop_dispatch_point(screen_x, screen_y) {
+                Ok(point) => point,
+                Err(error) => {
+                    return ToolResult::error(format!("Desktop scroll refused: {error}"))
+                        .with_structured(
+                            json!({"code":"invalid_desktop_point","effect":"refused"}),
+                        )
+                }
+            };
             let amount = input.amount.unwrap_or(3).clamp(1, 50) as usize;
             let display = direction.clone();
             let wayland = crate::wayland::wayland_input_enabled();
@@ -9270,6 +10196,12 @@ impl Tool for ScrollTool {
                 Ok(Err(error)) => ToolResult::error(error.to_string()),
                 Err(error) => ToolResult::error(format!("Task error: {error}")),
             };
+        }
+        if args.get("capture_id").is_some() {
+            return ToolResult::error(
+                "capture_id for scroll requires an unaddressed desktop target",
+            )
+            .with_structured(json!({"code":"invalid_capture_target","effect":"refused"}));
         }
         let mut pid = match args.require_u32("pid") {
             Ok(v) => v,
@@ -9409,6 +10341,29 @@ impl Tool for ScrollTool {
             return ToolResult::error(
                 "Pass either element_index (ax) or x,y (px) to scroll, not both.",
             );
+        }
+        if isolated_background {
+            if xid_opt.is_none() {
+                return isolated_hyprland_refusal(
+                    "an exact window_id or window-bound element token is required",
+                );
+            }
+            if let Some(result) = xwayland_hyprland_action_if_target(
+                &args,
+                pid,
+                xid,
+                &crate::wayland::hyprland_input::Action::Scroll {
+                    point: pixel_target,
+                    direction: direction.clone(),
+                    amount,
+                },
+                false,
+                resolved_element_index.is_some(),
+            )
+            .await
+            {
+                return result;
+            }
         }
 
         if named_session_cursor_key(&args).is_some() {
@@ -10372,6 +11327,7 @@ impl Tool for DragTool {
                 "modifier": cua_driver_core::tool_schema::modifier_schema(),
                 "button": cua_driver_core::tool_schema::button_schema(),
                 "from_zoom":{"type":"boolean"},
+                "capture_id":{"type":"string","description":"Capture handle from get_window_state or get_desktop_state. The exact screenshot and target geometry are checked before dispatch."},
                 "scope":{"type":"string","enum":["window","desktop"],"default":"window"},
                 "coordinate_frame": coordinate_frame_schema(),
                 "delivery_mode": crate::input::delivery::delivery_mode_schema()
@@ -10389,11 +11345,55 @@ impl Tool for DragTool {
                 Ok(input) => input,
                 Err(result) => return result,
             };
-            let (from_x, from_y) = (input.from_x, input.from_y);
-            let (to_x, to_y) = (input.to_x, input.to_y);
+            let ((from_x, from_y), (to_x, to_y)) =
+                if let Some(id) = args.get("capture_id").and_then(Value::as_str) {
+                    match crate::capture_action_frame::admit_desktop_drag(
+                        &self.state.capture_service,
+                        &args,
+                        id,
+                        (input.from_x, input.from_y),
+                        (input.to_x, input.to_y),
+                    ) {
+                        Ok(points) => points,
+                        Err(error) => return capture_admission_error(error),
+                    }
+                } else {
+                    ((input.from_x, input.from_y), (input.to_x, input.to_y))
+                };
+            let steps_for_geometry = input.steps.unwrap_or(20).clamp(1, 200) as u32;
+            // Validate the whole pointer path before pressing; a straight drag
+            // through an output gap must never be clamped onto another monitor.
+            if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                for step in 0..=steps_for_geometry {
+                    let t = f64::from(step) / f64::from(steps_for_geometry);
+                    let x = from_x + (to_x - from_x) * t;
+                    let y = from_y + (to_y - from_y) * t;
+                    if let Err(error) = desktop_dispatch_point(x, y) {
+                        return ToolResult::error(format!("Desktop drag refused: {error}"))
+                            .with_structured(
+                                json!({"code":"invalid_desktop_point","effect":"refused"}),
+                            );
+                    }
+                }
+            }
+            let ((from_x, from_y), (to_x, to_y)) = match (
+                desktop_dispatch_point(from_x, from_y),
+                desktop_dispatch_point(to_x, to_y),
+            ) {
+                (Ok((fx, fy)), Ok((tx, ty))) => (
+                    (f64::from(fx), f64::from(fy)),
+                    (f64::from(tx), f64::from(ty)),
+                ),
+                (Err(error), _) | (_, Err(error)) => {
+                    return ToolResult::error(format!("Desktop drag refused: {error}"))
+                        .with_structured(
+                            json!({"code":"invalid_desktop_point","effect":"refused"}),
+                        )
+                }
+            };
             let button = parse_mouse_button(input.button.unwrap_or(ClickButton::Left).as_str());
             let duration_ms = input.duration_ms.unwrap_or(500).min(10_000);
-            let steps = input.steps.unwrap_or(20).clamp(1, 200) as usize;
+            let steps = steps_for_geometry as usize;
             let wayland = crate::wayland::wayland_input_enabled();
             let path = if wayland { "wayland_desktop" } else { "xtest" };
             let result = tokio::task::spawn_blocking(move || {
@@ -10439,6 +11439,10 @@ impl Tool for DragTool {
                 Ok(Err(error)) => ToolResult::error(error.to_string()),
                 Err(error) => ToolResult::error(format!("Task error: {error}")),
             };
+        }
+        if args.get("capture_id").is_some() {
+            return ToolResult::error("capture_id for drag requires an unaddressed desktop target")
+                .with_structured(json!({"code":"invalid_capture_target","effect":"refused"}));
         }
         let pid = match args.require_u32("pid") {
             Ok(v) => v,
@@ -10578,28 +11582,46 @@ impl Tool for DragTool {
                 to_y.round() as i32,
             );
             let (started, acknowledged) = tokio::sync::oneshot::channel();
-            let (_cancellation, mut dispatch) =
-                match spawn_isolated_hyprland(&args, move |cancellation| {
-                    crate::wayland::hyprland_input::execute_foreground_with_started(
-                        owner,
-                        pid,
-                        xid,
-                        crate::wayland::hyprland_input::Action::Drag {
-                            from: (from_x, from_y),
-                            to: (to_x, to_y),
-                            duration_ms,
-                        },
-                        Some(started),
-                        cancellation,
-                    )
-                }) {
-                    Ok(dispatch) => dispatch,
-                    Err(_) => {
-                        return foreground_hyprland_refusal(
-                            "authenticated admitted lifecycle required",
-                        )
+            let (_cancellation, mut dispatch) = match spawn_isolated_hyprland(
+                &args,
+                move |cancellation| {
+                    let action = crate::wayland::hyprland_input::Action::Drag {
+                        from: (from_x, from_y),
+                        to: (to_x, to_y),
+                        duration_ms,
+                    };
+                    match crate::wayland::hyprland::target_kind(pid, xid)? {
+                        crate::wayland::hyprland::TargetKind::Native => {
+                            crate::wayland::hyprland_input::execute_foreground_with_started(
+                                owner,
+                                pid,
+                                xid,
+                                action,
+                                Some(started),
+                                cancellation,
+                            )
+                        }
+                        crate::wayland::hyprland::TargetKind::XWayland => {
+                            let xwindow =
+                                crate::wayland::hyprland_input::inspect_xwayland(pid, xid)?;
+                            crate::wayland::hyprland_input::execute_xwayland_foreground_with_started(
+                                owner,
+                                pid,
+                                xid,
+                                xwindow,
+                                action,
+                                Some(started),
+                                cancellation,
+                            )
+                        }
                     }
-                };
+                },
+            ) {
+                Ok(dispatch) => dispatch,
+                Err(_) => {
+                    return foreground_hyprland_refusal("authenticated admitted lifecycle required")
+                }
+            };
             let acknowledged = acknowledged.await.is_ok();
             let result = if acknowledged {
                 overlay_snap_to_for(&cursor_id, from.0 as f64, from.1 as f64, None);
@@ -10628,6 +11650,23 @@ impl Tool for DragTool {
                 return isolated_hyprland_refusal(
                     "isolated drag supports only an unmodified left button",
                 );
+            }
+            let target = tokio::task::spawn_blocking(move || {
+                crate::wayland::hyprland::target_kind(pid, xid)
+            })
+            .await;
+            match target {
+                Ok(Ok(crate::wayland::hyprland::TargetKind::Native)) => {}
+                Ok(Ok(crate::wayland::hyprland::TargetKind::XWayland)) =>
+                    return isolated_hyprland_refusal(
+                        "XWayland background drag has no isolated gesture route; request explicit foreground delivery",
+                    ),
+                Ok(Err(error)) => return isolated_hyprland_refusal(format!(
+                    "exact Hyprland drag target identity unavailable: {error}"
+                )),
+                Err(error) => return isolated_hyprland_refusal(format!(
+                    "target identity observation failed: {error}"
+                )),
             }
             let owner = named_session_cursor_key(&args);
             let from = crate::wayland::window_local_to_output(
@@ -11896,10 +12935,7 @@ impl Tool for GetScreenSizeTool {
     fn def(&self) -> &ToolDef {
         GSS_DEF.get_or_init(|| ToolDef {
             name: "get_screen_size".into(),
-            description: "Return the logical size of the main display in points plus its backing \
-                scale factor. Agents click in points; Retina displays have scale_factor 2.0. \
-                Requires no TCC permissions."
-                .into(),
+            description: "Return the logical desktop screenshot-frame bounding dimensions in points. Hyprland multi-output layouts may contain gaps; scale_factor is 1.0 for the logical action frame.".into(),
             input_schema: json!({"type":"object","properties":{
                 "session": cua_driver_core::tool_schema::session_schema()
             },"additionalProperties":false}),
@@ -11915,10 +12951,8 @@ impl Tool for GetScreenSizeTool {
         }
         let result = tokio::task::spawn_blocking(|| {
             if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
-                // Shared manifest admission needs content-free display
-                // metadata even when this native desktop has no X11 DISPLAY.
-                // The adapter attests the IPC/Wayland compositor peer and
-                // refuses layouts outside its qualified 1:1 single-output frame.
+                // The Hyprland adapter reports the logical bounding frame
+                // across powered outputs; gaps are not valid action points.
                 return crate::wayland::hyprland::screen_size();
             }
             // X11 reports pixel dimensions; scale factor on X11 is not
@@ -12022,9 +13056,11 @@ impl Tool for GetDesktopStateTool {
     fn def(&self) -> &ToolDef {
         GDS_DEF.get_or_init(|| ToolDef {
             name: "get_desktop_state".into(),
-            description: "Capture the full display in the desktop action coordinate frame. \
-                Use the returned PNG directly as the coordinate source for actions whose target is \
-                {kind:\"desktop\",display_id:\"primary\"}. No AT-SPI walk.".into(),
+            description: "Capture the full powered desktop layout in a single screenshot \
+                coordinate frame, including offset outputs. Use capture_id with an exact \
+                pid/window_id for native background input to a popup shown in this frame. \
+                Gaps and uncaptured or changed surfaces are refused. A windowless desktop \
+                action is explicit foreground control, not isolated background input.".into(),
             input_schema: json!({"type":"object","properties":{
                 "session":{"type":"string","description":"For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session."},
                 "screenshot_out_file":{"type":"string","description":"Write PNG here instead of base64."},
@@ -12048,7 +13084,8 @@ impl Tool for GetDesktopStateTool {
             // Capture the full display at native size first. When the
             // compositor consumes logical input coordinates, normalize the
             // image below so screenshot pixels still land exactly.
-            let native_png = crate::capture::screenshot_display_bytes()?;
+            let (native_png, hyprland_frame) =
+                crate::capture::screenshot_display_bytes_with_geometry()?;
             let (native_w, native_h) = crate::capture::png_dimensions_pub(&native_png)?;
             // True screen size. On a pure-Wayland session (native backend
             // opted in, no X11 DISPLAY) the capture above came from the
@@ -12059,7 +13096,9 @@ impl Tool for GetDesktopStateTool {
             // abort the tool even though the screenshot already succeeded.
             // Only fall back to the X11 root-window geometry off Wayland, so
             // the X11 / XWayland path is unchanged. See #2017 / Sway testing.
-            let (screen_w, screen_h) = if crate::wayland::is_wayland() {
+            let (screen_w, screen_h) = if let Some(captured) = &hyprland_frame {
+                (captured.frame.width, captured.frame.height)
+            } else if crate::wayland::is_wayland() {
                 crate::capture_action_frame::desktop_action_dimensions((native_w, native_h))?
             } else {
                 x11_screen_size()?
@@ -12095,13 +13134,44 @@ impl Tool for GetDesktopStateTool {
             let mut windows = crate::wayland::list_windows_dispatch(None);
             windows
                 .retain(|w| w.is_on_screen && w.pid.map_or(false, crate::proc_fs::is_process_live));
-            let capture_id = crate::capture_action_frame::publish_desktop(
-                &capture_service,
-                &capture_args,
-                &png,
-                (shot_w, shot_h),
-                (screen_w, screen_h),
-            )?;
+            let scene = hyprland_frame.as_ref().map(|captured| {
+                let scale_x = f64::from(shot_w) / f64::from(captured.frame.width);
+                let scale_y = f64::from(shot_h) / f64::from(captured.frame.height);
+                let inventory = captured.inventory.as_ref();
+                json!({
+                    "frame_origin": {"x":captured.frame.x,"y":captured.frame.y},
+                    "surface_tree_available": inventory.is_some(),
+                    "scene_epoch": inventory.map(|scene| scene.epoch.as_str()),
+                    "scene_revision": inventory.map(|scene| scene.tree_revision),
+                    "captured_surfaces": inventory.map(|scene| scene.rows.iter().map(|row| json!({
+                        "pid":row.pid,"window_id":row.address,
+                        "surface_id":row.surface_id,"popup":row.popup,
+                        "screenshot_bounds":{
+                            "x":(row.box_[0]-f64::from(captured.frame.x))*scale_x,
+                            "y":(row.box_[1]-f64::from(captured.frame.y))*scale_y,
+                            "width":row.box_[2]*scale_x,"height":row.box_[3]*scale_y
+                        }
+                    })).collect::<Vec<_>>()),
+                })
+            });
+            let capture_id = if let Some(frame) = hyprland_frame {
+                crate::capture_action_frame::publish_desktop_with_frame(
+                    &capture_service,
+                    &capture_args,
+                    &png,
+                    (shot_w, shot_h),
+                    (screen_w, screen_h),
+                    frame,
+                )?
+            } else {
+                crate::capture_action_frame::publish_desktop(
+                    &capture_service,
+                    &capture_args,
+                    &png,
+                    (shot_w, shot_h),
+                    (screen_w, screen_h),
+                )?
+            };
             Ok((
                 b64,
                 shot_w,
@@ -12112,6 +13182,7 @@ impl Tool for GetDesktopStateTool {
                 written,
                 windows,
                 capture_id,
+                scene,
             ))
         })
         .await;
@@ -12127,6 +13198,7 @@ impl Tool for GetDesktopStateTool {
                 written,
                 windows,
                 capture_id,
+                scene,
             ))) => {
                 let frame_scale = if shot_w > 0 {
                     f64::from(screen_w) / f64::from(shot_w)
@@ -12147,6 +13219,9 @@ impl Tool for GetDesktopStateTool {
                     "windows": windows.iter().map(window_record_json).collect::<Vec<_>>(),
                     "capture_id": capture_id,
                 });
+                if let Some(scene) = scene {
+                    structured["scene"] = scene;
+                }
                 if (frame_scale - 1.0).abs() > 0.001 {
                     // Capped: the uncapped capture is the action frame.
                     structured["screenshot_original_width"] = json!(screen_w);
@@ -12155,11 +13230,22 @@ impl Tool for GetDesktopStateTool {
                 if let Some(b64) = b64_opt {
                     content.push(cua_driver_core::protocol::Content::image_png(b64));
                 }
-                let window_lines = desktop_window_lines(&windows, frame_scale);
+                let origin = (
+                    structured
+                        .pointer("/scene/frame_origin/x")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    structured
+                        .pointer("/scene/frame_origin/y")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                );
+                let window_lines =
+                    desktop_window_lines(&windows, (shot_w, shot_h), (screen_w, screen_h), origin);
                 let frame_note = if (frame_scale - 1.0).abs() > 0.001 {
                     format!(
-                        "; x/y for scope:\"desktop\" actions are pixels of THIS screenshot \
-                         (mapped ×{frame_scale:.2} back to the screen automatically)"
+                        "; x/y from THIS capped screenshot require its capture_id on \
+                         scope:\"desktop\" actions (mapped ×{frame_scale:.2} into the full desktop)"
                     )
                 } else {
                     String::new()
@@ -12190,9 +13276,18 @@ impl Tool for GetDesktopStateTool {
 /// Text block naming every visible window with the `pid` / `window_id` pair
 /// that every other tool takes, so the model's first action targets a real
 /// process instead of guessing.
-fn desktop_window_lines(windows: &[crate::x11::WindowInfo], frame_scale: f64) -> String {
-    let px = |v: i32| (f64::from(v) / frame_scale).round() as i32;
-    let sz = |v: u32| (f64::from(v) / frame_scale).round() as u32;
+fn desktop_window_lines(
+    windows: &[crate::x11::WindowInfo],
+    screenshot: (u32, u32),
+    screen: (u32, u32),
+    origin: (i64, i64),
+) -> String {
+    let px = |v: i32, offset: i64, shot: u32, native: u32| {
+        ((v as i64 - offset) as f64 * f64::from(shot) / f64::from(native)).round() as i32
+    };
+    let sz = |v: u32, shot: u32, native: u32| {
+        (f64::from(v) * f64::from(shot) / f64::from(native)).round() as u32
+    };
     if windows.is_empty() {
         return "\nVisible windows: none (use list_windows / launch_app).".to_owned();
     }
@@ -12209,10 +13304,10 @@ fn desktop_window_lines(windows: &[crate::x11::WindowInfo], frame_scale: f64) ->
             w.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
             w.xid,
             title,
-            sz(w.width),
-            sz(w.height),
-            px(w.x),
-            px(w.y),
+            sz(w.width, screenshot.0, screen.0),
+            sz(w.height, screenshot.1, screen.1),
+            px(w.x, origin.0, screenshot.0, screen.0),
+            px(w.y, origin.1, screenshot.1, screen.1),
             if w.app_name.is_empty() {
                 String::new()
             } else {
@@ -12252,19 +13347,31 @@ impl Tool for GetCursorPositionTool {
         {
             return result;
         }
-        // Native Wayland: there's no protocol for clients to query the real
-        // global cursor position. Fall back to the synthetic registry that
-        // records every `motion_absolute` this process emits.
+        if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+            let result = tokio::task::spawn_blocking(|| {
+                let (x, y) = crate::wayland::hyprland::cursor_position()?;
+                let frame = crate::wayland::hyprland::desktop_frame()?;
+                Ok::<(i64, i64), anyhow::Error>(frame.from_layout(x, y))
+            })
+            .await;
+            return match result {
+                Ok(Ok((x, y))) => ToolResult::text(format!("✅ Cursor at ({x}, {y})"))
+                    .with_structured(
+                        json!({"x":x,"y":y,"source":"hyprland","coordinate_space":"desktop_frame"}),
+                    ),
+                Ok(Err(error)) => ToolResult::error(error.to_string()),
+                Err(error) => ToolResult::error(format!("Task error: {error}")),
+            };
+        }
+        // Other Wayland compositors cannot expose the primary pointer here.
         if crate::wayland::is_wayland() {
             return match crate::wayland::last_synth_cursor_pos() {
-                Some((x, y)) => ToolResult::text(
-                    format!("✅ Cursor at ({x}, {y}) (synthetic — last move_cursor in this process)")
-                ).with_structured(json!({
-                    "x": x, "y": y, "source": "synthetic"
-                })),
+                Some((x, y)) => ToolResult::text(format!("✅ Last synthetic cursor at ({x}, {y})"))
+                    .with_structured(json!({"x":x,"y":y,"source":"synthetic"})),
                 None => ToolResult::text(
-                    "Cursor position unknown on Wayland — no move_cursor has been issued in this process yet.".to_string()
-                ).with_structured(json!({ "source": "synthetic", "available": false })),
+                    "Primary cursor position unavailable on this Wayland compositor.",
+                )
+                .with_structured(json!({"source":"synthetic","available":false})),
             };
         }
         let result = tokio::task::spawn_blocking(|| {
@@ -12315,7 +13422,7 @@ impl Tool for MoveCursorTool {
             name: "move_cursor".into(),
             description: "Move the synthetic agent cursor without changing the user's pointer. Only an explicit scope=desktop request moves the real OS pointer in get_desktop_state coordinates.".into(),
             input_schema: json!({"type":"object","required":["x","y"],"properties":{
-                "x":{"type":"number"},"y":{"type":"number"},"session": cua_driver_core::tool_schema::session_schema(),"cursor_id":{"type":"string"},"scope":{"type":"string","enum":["window","desktop"],"default":"window"}
+                "x":{"type":"number"},"y":{"type":"number"},"session": cua_driver_core::tool_schema::session_schema(),"cursor_id":{"type":"string"},"scope":{"type":"string","enum":["window","desktop"],"default":"window"},"capture_id":{"type":"string","description":"Capture handle from get_window_state or get_desktop_state. The exact screenshot and target geometry are checked before dispatch."}
             },"additionalProperties":false}),
             read_only: false, destructive: false, idempotent: true, open_world: false,
         })
@@ -12327,9 +13434,30 @@ impl Tool for MoveCursorTool {
                 Ok(input) => input,
                 Err(result) => return result,
             };
-            let (x, y) = (input.x, input.y);
-            let xi = x.round() as i32;
-            let yi = y.round() as i32;
+            let (screen_x, screen_y) =
+                if let Some(id) = args.get("capture_id").and_then(Value::as_str) {
+                    match crate::capture_action_frame::admit_desktop_click(
+                        &self.state.capture_service,
+                        &args,
+                        id,
+                        input.x,
+                        input.y,
+                    ) {
+                        Ok(admitted) => admitted.frame_point,
+                        Err(error) => return capture_admission_error(error),
+                    }
+                } else {
+                    (input.x, input.y)
+                };
+            let (xi, yi) = match desktop_dispatch_point(screen_x, screen_y) {
+                Ok(point) => point,
+                Err(error) => {
+                    return ToolResult::error(format!("Desktop cursor move refused: {error}"))
+                        .with_structured(
+                            json!({"code":"invalid_desktop_point","effect":"refused"}),
+                        )
+                }
+            };
             let wayland = crate::wayland::wayland_input_enabled();
             let path = if wayland {
                 "wayland_desktop"
@@ -12355,6 +13483,10 @@ impl Tool for MoveCursorTool {
                 Ok(Err(error)) => ToolResult::error(error.to_string()),
                 Err(error) => ToolResult::error(format!("Task error: {error}")),
             };
+        }
+        if args.get("capture_id").is_some() {
+            return ToolResult::error("capture_id for move_cursor requires scope:\"desktop\"")
+                .with_structured(json!({"code":"invalid_capture_target","effect":"refused"}));
         }
         let x = args.f64_or("x", 0.0);
         let y = args.f64_or("y", 0.0);
@@ -12526,7 +13658,9 @@ impl Tool for SetAgentCursorThemeTool {
     }
 }
 
-pub struct GetAgentCursorStateV2Tool;
+pub struct GetAgentCursorStateV2Tool {
+    state: Arc<ToolState>,
+}
 
 static CURSOR_STATE_V2_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
@@ -12538,6 +13672,12 @@ impl Tool for GetAgentCursorStateV2Tool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         let session = resolve_cursor_key(&args);
+        let position = self
+            .state
+            .cursor_registry
+            .get(&session)
+            .and_then(|cursor| cursor.x.zip(cursor.y))
+            .map(|(x, y)| json!({"x": x, "y": y}));
         let enabled = crate::overlay::is_enabled_for(&session);
         let motion = crate::overlay::current_motion_for(&session);
         let (theme_id, version, profile, fallback, visual) =
@@ -12561,7 +13701,7 @@ impl Tool for GetAgentCursorStateV2Tool {
             json!({
                 "session":session,
                 "enabled":enabled,
-                "position":null,
+                "position":position,
                 "theme":{
                     "id":theme_id,
                     "version":version,
@@ -13827,6 +14967,7 @@ pub fn build_registry_with_provider(
         cua_driver_core::session::register_scoped_fallible_session_end_hook(
             "linux_input",
             move |session_id| {
+                crate::owned_xpra::stop_owner(session_id);
                 if crate::wayland::is_wayland() {
                     release_mouse_hold_for_session(
                         &state_for_session_end,
@@ -13866,6 +15007,7 @@ pub fn build_registry_with_provider(
         let capture_service = state.capture_service.clone();
         r.retain_runtime_cleanup(move || {
             crate::capture_action_frame::retire_runtime(&capture_service);
+            crate::owned_xpra::stop_runtime_prefix(&prefix);
             crate::wayland::hyprland_input::cleanup_runtime(&prefix);
             for cursor in cursor_registry
                 .all_states()
@@ -13893,6 +15035,7 @@ pub fn build_registry_with_provider(
         )),
     ));
     r.register(Box::new(LaunchAppTool));
+    r.register(Box::new(StopOwnedSessionTool));
     r.register(Box::new(KillAppTool));
     let pid_window_candidates: PidWindowGuardParts = (
         Arc::new(pid_window_target_candidates),
@@ -13982,6 +15125,9 @@ pub fn build_registry_with_provider(
         &mut r,
         Arc::new(crate::clipboard::LinuxClipboard::new()),
     );
+    r.register(Box::new(seat_selection::SetAgentSelectionTool));
+    r.register(Box::new(seat_selection::ClearAgentSelectionTool));
+    r.register(Box::new(transfer::TransferDataTool::new(state.clone())));
     // `screenshot` removed - see the matching comment in
     // platform-windows/src/tools/impl_.rs::build_registry. Canonical
     // screenshot path is `get_window_state` (it always returns a screenshot now).
@@ -13998,7 +15144,9 @@ pub fn build_registry_with_provider(
         state: state.clone(),
     }));
     r.register(Box::new(SetAgentCursorMotionV2Tool));
-    r.register(Box::new(GetAgentCursorStateV2Tool));
+    r.register(Box::new(GetAgentCursorStateV2Tool {
+        state: state.clone(),
+    }));
     r.register(Box::new(SetAgentCursorThemeTool {
         state: state.clone(),
     }));

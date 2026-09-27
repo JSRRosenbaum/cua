@@ -1137,7 +1137,7 @@ pub async fn run_serve(
                                     Ok(serde_json::json!({"revoked": count, "scope": "all"}))
                                 } else if !all {
                                     match session {
-                                        Some(session) => reg.end_session(session).await.map(|()| {
+                                        Some(session) => reg.revoke_public_session(session).await.map(|()| {
                                             serde_json::json!({"revoked": 1, "scope": "session"})
                                         }),
                                         None => Err(
@@ -1878,7 +1878,7 @@ pub async fn run_serve(
                                     Ok(serde_json::json!({"revoked": count, "scope": "all"}))
                                 } else if !all {
                                     match session {
-                                        Some(session) => reg.end_session(session).await.map(|()| {
+                                        Some(session) => reg.revoke_public_session(session).await.map(|()| {
                                             serde_json::json!({"revoked": 1, "scope": "session"})
                                         }),
                                         None => Err(

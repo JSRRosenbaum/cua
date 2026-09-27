@@ -3502,6 +3502,7 @@ dependencies = [
  "libspa",
  "memmap2",
  "meval",
+ "parking_lot",
  "pip-preview",
  "pipewire",
  "reis",

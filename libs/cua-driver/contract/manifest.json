@@ -299,7 +299,8 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input"
+              "trusted_input",
+              "data_transfer"
             ],
             "type": "string"
           },
@@ -451,6 +452,19 @@
           "privacy_sensitive": {
             "type": "boolean"
           },
+          "selection_owner": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "selection_scope": {
+            "type": "string"
+          },
           "supported": {
             "type": "boolean"
           },
@@ -469,7 +483,9 @@
           "written_type",
           "types",
           "privacy_sensitive",
-          "content_redacted_from_telemetry"
+          "content_redacted_from_telemetry",
+          "selection_scope",
+          "selection_owner"
         ],
         "type": "object"
       }
@@ -735,7 +751,8 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input"
+              "trusted_input",
+              "data_transfer"
             ],
             "type": "string"
           },
@@ -2172,7 +2189,8 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input"
+              "trusted_input",
+              "data_transfer"
             ],
             "type": "string"
           },
@@ -2376,7 +2394,8 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input"
+              "trusted_input",
+              "data_transfer"
             ],
             "type": "string"
           },
@@ -3012,7 +3031,8 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input"
+              "trusted_input",
+              "data_transfer"
             ],
             "type": "string"
           },
@@ -3765,7 +3785,8 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input"
+              "trusted_input",
+              "data_transfer"
             ],
             "type": "string"
           },
@@ -4035,7 +4056,8 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input"
+              "trusted_input",
+              "data_transfer"
             ],
             "type": "string"
           },
@@ -4552,7 +4574,8 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input"
+              "trusted_input",
+              "data_transfer"
             ],
             "type": "string"
           },
@@ -4938,7 +4961,8 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input"
+              "trusted_input",
+              "data_transfer"
             ],
             "type": "string"
           },

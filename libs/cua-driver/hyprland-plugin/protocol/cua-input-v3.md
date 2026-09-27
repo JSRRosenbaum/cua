@@ -45,10 +45,10 @@ its original seat names.
 
 The request sequence for every Driver-admitted action is:
 
-1. Send `HELLO` once per connection. The response is
-   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true}`
-   for a production plugin implementing the foreground extension. Driver must
-   require that explicit capability before using the foreground route.
+1. Send `HELLO` once per connection. The production response includes
+   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true,
+   "keyboard_layout_independent":true,"foreground_numlock_compatible":true}`.
+   Driver must require explicit `foreground_target` before using that route.
 2. Send `CLAIM`. The response is `{"ok":true,"lane":0}` or lane `1`.
 3. For background input, send `TARGET <pid> <hex-address> <capability>`.
    For foreground input, send
@@ -71,6 +71,61 @@ discovered address is an input to attestation, not a surface lifetime token.
 Surface unmap, destruction, or replacement invalidates the binding. Geometry
 changes increment the revision and refuse stale actions.
 
+### Screenshot-bound window admission
+
+`FRAME_INVENTORY_BEGIN` returns an inventory token, epoch, tree revision, and row
+count; `FRAME_INVENTORY_PAGE <token> <offset>` pages compositor-attested rows.
+Each row binds PID, Hyprland address, surface ID, surface lifetime, six-element
+root geometry, four-element global hit box, and popup status. The inventory
+includes mapped XWayland roots but desktop-frame actions remain native-only.
+`INSPECT_WINDOW_HIT <pid> <hex-address> <local-x> <local-y>` returns the exact
+window-local root and hit rows, scene epoch/revision, and `xid` (`null` for native).
+It does not require the window to be on the active workspace or topmost; it
+refuses uncaptured popups. `INSPECT_XWAYLAND_CAPTURE <pid> <hex-address>` returns
+the mapped XID and actual compositor root row under that scene revision.
+
+`WINDOW_CAPTURE_TARGET <pid> <hex-address> <capability> <x|->
+<y|-> <epoch> <tree-revision> <root-id> <root-lifetime>
+<root-geometry-6> <hit-id|0> <hit-lifetime|-> <hit-box-4|zero> <popup-0>`
+binds a previously captured native window scene. For point capabilities 1, 4,
+and 8, the initial action point and exact child hit must match the captured
+row. Nonpoint capabilities 2, 32, 128, and 256 use `- -`, hit ID zero, lifetime
+`-`, and zero box, retaining root and scene proof only. The compositor checks
+root identity/geometry, exact hit identity/box, and scene revision at admission
+and again before dispatch and during a bounded gesture. A window-local captured
+action intentionally does not require desktop topmost visibility.
+
+`XWAYLAND_CAPTURE_FOREGROUND_TARGET <pid> <hex-address> <capability>
+<xid> <x> <y> <epoch> <tree-revision> <root-id> <root-lifetime>
+<root-geometry-6>` has the same one-shot captured root fence, restricted to
+point capabilities 1, 4, and 8, with a separate exact XID binding. Its
+primary-seat foreground route also requires a visible topmost endpoint and
+physical-input interlocks; it never silently substitutes global XTest.
+
+For capture-bound cross-window transfer, `DND_CAPTURE_TARGET` or
+`FOREGROUND_DND_CAPTURE_TARGET` carries both endpoint PIDs/addresses, cap 64,
+then two 20-field endpoint proofs. Each proof is `x y epoch tree-revision
+root-id root-lifetime root-geometry-6 hit-id hit-lifetime hit-box-4 popup-0
+xid-or-0`. Native DnD rejects XWayland endpoints. The explicit primary
+foreground route may bind mixed native/XWayland endpoints; it rechecks each
+XID, captured root and exact hit throughout press/motion/drop. Captured
+transfer never falls back to a fresh unbound `DND_TARGET`.
+
+`TEXT_FOCUS <sequence> <target> <revision>` sends the exact agent-seat keyboard
+enter without spending a cap 32 or 256 grant. After the client has processed
+that enter, `TEXT_STATUS <sequence> <target> <revision>` reports read-only
+`{"ok":true,"ready":true|false}` based on a unique enabled, newly committed
+text-input binding for that seat and surface. Each request advances the
+connection sequence, and neither extends the five-second grant. Only then
+does `TEXT`, `TEXT_COMMIT`, or `TEXT_PREEDIT` consume the grant and send text;
+timeout, cancellation, and stale focus do not replay text.
+
+Other private one-shot capabilities include text 32, DnD 64, clipboard
+selection 128, and target-guarded semantic/text-input 256. `SELECTION_TARGET`
+binds cap 128; `SET_SELECTION` offers bounded UTF-8 data for at most 60 seconds
+to the exact agent seat, and `CLEAR_SELECTION` clears only the caller-owned
+lane. These are not global primary-selection/data-control mutations.
+
 The complete operation requests are:
 
 | Request | Limits |
@@ -81,10 +136,11 @@ The complete operation requests are:
 | `SCROLL <sequence> <target> <revision> <x> <y> <axis> <value>` | Axis 0=vertical, 1=horizontal; nonzero value in [-1000,1000]. |
 | `DRAG <sequence> <target> <revision> <x1> <y1> <x2> <y2> <duration_ms>` | Left button; duration 50–2000 ms; the grant must cover the duration plus 50 ms. |
 
-Coordinates are finite logical surface-local values, with `0 <= x < width`
-and `0 <= y < height`. Subsurface hits refuse. Sequence numbers increase
-strictly across the connection, including fresh target selections. Repeated
-or lower sequences return `replay`; no operation is replayed automatically.
+Coordinates are finite logical window-local values, with `0 <= x < width`
+and `0 <= y < height`. Native pointer delivery can target the exact captured
+child surface; an uncaptured popup refuses. Sequence numbers increase strictly
+across the connection, including focus/readiness phases. Repeated or lower
+sequences return `replay`; no operation is replayed automatically.
 
 The plugin repeats target, geometry, desktop, keymap, and conflict checks on
 the compositor thread at
@@ -174,14 +230,15 @@ buttons, active grabs, pointer constraints, and drag-and-drop. It requires a
 single primary seat binding, excluding its own agent seats by resource identity,
 and refuses binding or input-resource changes during dispatch. Keyboard delivery
 requires the physical keymap to match canonical `evdev`/`pc105`/`us`, with
-neutral primary modifiers and layout group zero; remaps, latched or locked
-modifiers refuse before activation. Foreground pointer-only actions do not
-depend on the physical keyboard layout. Foreground drag
-cancellation on primary-input and focus transitions remains subject to review
-and native verification; do not infer background isolation from this route.
-Foreground results use foreground delivery metadata. A drag cancellation after
-its start is partial, and a missing acknowledgement is unknown, under the same
-no-replay rules as background delivery.
+neutral depressed/latched modifiers and layout group zero; remaps and locked
+modifiers other than physical NumLock refuse before activation. The physical
+NumLock state is preserved on the primary seat while the private agent keymap
+remains fixed US. Foreground pointer-only actions do not depend on the physical
+keyboard layout. Physical input or focus conflicts cancel the bounded drag;
+after an acknowledged press its result is partial/unknown, never inferred
+application acceptance. Foreground DnD uses the ordinary primary-seat drag
+source and XWM bridge, not a private-seat offer or `XTest` fallback. A missing
+acknowledgement is unknown under the same no-replay rules.
 
 Discovery or activation read-back followed by global `wtype` input does not
 establish exact-target delivery and is not a fallback. Background refusal never
@@ -225,20 +282,32 @@ of bounded cleanup latency.
 ## Compatibility and build gates
 
 For background `TARGET`, Driver restricts app/package/version/operation
-eligibility before connecting. Its qualification scope remains native Calc and
-Inkscape. Foreground `FOREGROUND_TARGET` has no Calc/Inkscape package gate; its
-scope is ordinary native top-level surfaces. Native GTK3, Electron, and Tauri
-foreground coverage is planned and still requires certification. The plugin checks
-native surface identity, geometry, client conflicts, and exact compiled XKB
-content against the default `evdev`/`pc105`/`us` keymap. Variants, options,
-remaps, multiple groups, missing keyboards, XWayland, Unicode, IME input,
-arbitrary held-key streams, and modified pointer gestures are outside this
-candidate. Layout names alone never establish eligibility. Existing semantic
-Driver routes retain their own behavior.
+eligibility before connecting. Its prior qualified scope remains native Calc
+and Inkscape; new private-seat text, selection, DnD, modified click, hover,
+precise scroll, bounded path drag, captured child hits, and guarded popups are
+implemented source routes, not newly certified app/version coverage. A
+window-local export excludes popups; desktop-frame capture can bind a visible
+popup under the exact frame hit and agent-seat grab policy.
 
-Driver expands bounded ASCII text into complete key operations under the exact
-US keymap. The protocol adds no text or IME stream. Background application
-qualification is unchanged by this foreground extension.
+Foreground `FOREGROUND_TARGET` has no Calc/Inkscape package gate. Ordinary
+native top-level actions, captured XWayland root actions and the guarded
+cross-window primary-seat DnD/XWM path have distinct source routes and
+physical-input interlocks. The source does not use global XTest as a fallback.
+Native GTK3, Electron, Tauri, and XWayland app behavior still requires
+per-operation certification. For foreground keyboard delivery the plugin
+checks exact compiled canonical `evdev`/`pc105`/`us` keymap content; variants,
+options, remaps, multiple groups, and missing keyboards refuse. Physical
+NumLock is preserved while other locked modifiers refuse. Layout names alone
+never establish eligibility. Arbitrary held-key streams remain unsupported.
+Existing semantic Driver routes retain their own permission and qualification
+checks.
+
+`TEXT` and `TEXT_COMMIT` deliver bounded UTF-8 through an enabled exact-seat
+text-input binding after explicit focus/readiness; `TEXT_PREEDIT` uses the
+same bound client with bounded cursor indices. This is not an independent IME
+server or a promise that every application implements text-input. The earlier
+ASCII key-expansion route remains separate. Application effects need
+independent observation; protocol delivery is not acceptance.
 
 Build against the exact Hyprland 0.56.2 ABI with `CUA_HYPRLAND_INPUT=ON`.
 This option defaults to `OFF` and is mutually exclusive with

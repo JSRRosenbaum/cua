@@ -1,6 +1,6 @@
-//! Compatibility admission for the initial native Hyprland input package.
-//! This is not a security boundary against same-user code. Unknown package
-//! versions refuse until the native operation matrix is qualified for them.
+//! Compatibility admission for native Hyprland background input.
+//! Package qualification is an operation-compatibility claim, not an authorization
+//! grant. The compositor still binds each dispatch to the live native surface.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,38 @@ const PACKAGES: &[QualifiedPackage] = &[
         executable: "/usr/bin/inkscape",
     },
 ];
+
+/// Local, explicit compatibility selection. General-native does not certify a
+/// toolkit or change permissions, delivery routes, compositor conflict checks,
+/// or the result's unverifiable application effect. Adapted independently from
+/// trycua/cua#4230 (general-native eligibility; no four-lane changes).
+pub(super) const COMPATIBILITY_MODE_ENV: &str = "CUA_HYPRLAND_COMPATIBILITY_MODE";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CompatibilityMode {
+    Certified,
+    GeneralNative,
+}
+
+impl CompatibilityMode {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Certified => "certified",
+            Self::GeneralNative => "general-native",
+        }
+    }
+}
+
+fn selected_mode(value: Option<&str>) -> CompatibilityMode {
+    match value {
+        Some("general-native") => CompatibilityMode::GeneralNative,
+        _ => CompatibilityMode::Certified,
+    }
+}
+
+pub(super) fn compatibility_mode() -> CompatibilityMode {
+    selected_mode(std::env::var(COMPATIBILITY_MODE_ENV).ok().as_deref())
+}
 
 fn field<'a>(description: &'a str, name: &str) -> Option<&'a str> {
     let mut lines = description.lines();
@@ -47,6 +79,17 @@ fn read_bounded(path: &Path) -> Result<String, &'static str> {
 }
 
 pub(super) fn qualify(pid: u32) -> Result<(), &'static str> {
+    qualify_in_mode(pid, compatibility_mode())
+}
+
+fn qualify_in_mode(pid: u32, mode: CompatibilityMode) -> Result<(), &'static str> {
+    if mode == CompatibilityMode::GeneralNative {
+        // Still require a live process. Exact process/surface ownership and
+        // non-XWayland identity are independently checked before dispatch.
+        return std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|_| ())
+            .map_err(|_| "client_qualification_unavailable");
+    }
     let process_exe = PathBuf::from(format!("/proc/{pid}/exe"));
     let executable =
         std::fs::read_link(&process_exe).map_err(|_| "client_qualification_unavailable")?;
@@ -96,5 +139,24 @@ mod tests {
     #[test]
     fn nonexistent_process_cannot_be_qualified() {
         assert!(qualify(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn general_native_is_explicit_and_does_not_admit_a_dead_client() {
+        for value in [None, Some("1"), Some("true"), Some("general-native ")] {
+            assert_eq!(selected_mode(value), CompatibilityMode::Certified);
+        }
+        assert_eq!(
+            selected_mode(Some("general-native")),
+            CompatibilityMode::GeneralNative
+        );
+        assert_eq!(
+            qualify_in_mode(std::process::id(), CompatibilityMode::GeneralNative),
+            Ok(())
+        );
+        assert_eq!(
+            qualify_in_mode(u32::MAX, CompatibilityMode::GeneralNative),
+            Err("client_qualification_unavailable")
+        );
     }
 }

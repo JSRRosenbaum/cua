@@ -884,6 +884,19 @@ pub fn screenshot_display_bytes() -> Result<Vec<u8>> {
     )
 }
 
+/// Screenshot plus the layout and scene inventory observed around its pixels.
+/// The inventory is absent when the native input inspector is unavailable;
+/// native capture-bound actions then fail closed rather than guessing a hit.
+pub fn screenshot_display_bytes_with_geometry(
+) -> Result<(Vec<u8>, Option<crate::wayland::hyprland::CapturedDesktop>)> {
+    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+        let (png, captured) = crate::wayland::hyprland::capture_desktop_frame_png_with_geometry()?;
+        Ok((png, Some(captured)))
+    } else {
+        Ok((screenshot_display_bytes()?, None))
+    }
+}
+
 fn screenshot_display_bytes_with_dispatch(
     wayland_enabled: bool,
     wayland_capture: impl FnOnce() -> Result<Vec<u8>>,

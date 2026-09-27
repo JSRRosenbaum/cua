@@ -19,6 +19,9 @@ use cua_driver_core::health_report::{
 /// Wayland compositor advertises (foreign-toplevel / screencopy /
 /// virtual-pointer / wl_shm). Linux-specific; skipped when not on Wayland.
 pub const NAME_WAYLAND_BACKEND: &str = "wayland_backend";
+/// Admission mode for the native Hyprland input route, not an authorization
+/// status or a claim that an application's behavior has been certified.
+pub const NAME_NATIVE_COMPATIBILITY: &str = "native_compatibility";
 
 /// Linux canonical check names — same Swift-PR contract, with TCC /
 /// bundle entries surfaced as `skip("not applicable on Linux")`. The
@@ -34,6 +37,7 @@ pub const LINUX_CHECK_NAMES: &[&str] = &[
     NAME_AX_CAPABILITY,
     NAME_SCREEN_CAPTURE_CAPABILITY,
     NAME_WAYLAND_BACKEND,
+    NAME_NATIVE_COMPATIBILITY,
 ];
 
 pub struct LinuxHealthProvider;
@@ -59,12 +63,34 @@ impl HealthCheckProvider for LinuxHealthProvider {
             NAME_AX_CAPABILITY => check_ax_capability().await,
             NAME_SCREEN_CAPTURE_CAPABILITY => check_screen_capture_capability().await,
             NAME_WAYLAND_BACKEND => check_wayland_backend().await,
+            NAME_NATIVE_COMPATIBILITY => check_native_compatibility(),
             other => CheckEntry::skip(
                 other.to_owned(),
                 "Unknown check name (not implemented on this platform).",
             ),
         }
     }
+}
+
+fn check_native_compatibility() -> CheckEntry {
+    if !crate::wayland::hyprland_input::enabled() {
+        return CheckEntry::skip(
+            NAME_NATIVE_COMPATIBILITY,
+            "Native Hyprland input route is unavailable; compatibility selection cannot enable it.",
+        );
+    }
+    let mode = crate::wayland::native_compatibility_mode();
+    CheckEntry::pass(
+        NAME_NATIVE_COMPATIBILITY,
+        if mode == "general-native" {
+            "General-native admission explicitly selected: unqualified native clients may be \
+             attempted, but are not certified; exact-target authorization and compositor \
+             refusals remain in force. Application effect needs independent verification."
+        } else {
+            "Certified admission selected: only exact qualified native package versions enter \
+             the background input route."
+        },
+    )
 }
 
 // ── Individual checks ────────────────────────────────────────────────────────

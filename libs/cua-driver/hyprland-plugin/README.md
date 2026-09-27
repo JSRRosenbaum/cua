@@ -82,7 +82,9 @@ cmake --build build
 ```
 
 To compile the production-protocol candidate in a disposable test environment,
-add `-DCUA_HYPRLAND_INPUT=ON`. This is separate from
+install the `libeis-1.0` pkg-config development dependency and select the
+matching staged fork's headers through its rooted `hyprland.pc`, then add
+`-DCUA_HYPRLAND_INPUT=ON`. This is separate from
 `CUA_HYPRLAND_TEST_INPUT`; selecting both refuses. Detailed event measurement
 also requires `-DCUA_HYPRLAND_INPUT_TRACE=ON`. Do not ship that instrumentation
 in the production package. Neither build option loads or enables the plugin.

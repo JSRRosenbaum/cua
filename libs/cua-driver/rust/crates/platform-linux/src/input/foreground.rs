@@ -638,6 +638,24 @@ fn post_check(
     }
 }
 
+/// Refuse a visible takeover while the X server reports a pressed key or
+/// pointer button. This is a local-Xorg check only; Xwayland cannot expose
+/// the compositor's physical Wayland seat through QueryKeymap/QueryPointer.
+/// It must not be reused to authorize a host XWayland XTest route.
+fn primary_x11_input_idle() -> Result<()> {
+    let x = X11::open()?;
+    let keys = x.conn.query_keymap()?.reply()?;
+    let pointer = x.conn.query_pointer(x.root)?.reply()?;
+    let buttons = u16::from(pointer.mask) & 0x1f00;
+    if keys.keys.iter().any(|key| *key != 0) || buttons != 0 {
+        return Err(anyhow!(
+            "{CODE_UNAVAILABLE}: physical X11 keys or pointer buttons are held; \
+             no foreground input was sent"
+        ));
+    }
+    Ok(())
+}
+
 /// Activate `xid`, confirm it holds the active window + input focus within
 /// `opts.settle`, run `body`, then (for keyboard actions) report where focus
 /// ended up. Returns `foreground_unavailable` (no input sent) when the WM never
@@ -647,6 +665,7 @@ pub fn with_x11_foreground_opts<T>(
     opts: ForegroundOptions,
     body: impl FnOnce() -> Result<T>,
 ) -> Result<(T, ForegroundReport)> {
+    primary_x11_input_idle()?;
     let target = xid as Window;
     let phase_budget = opts.settle + Duration::from_millis(1500);
     let outcome = run_with_deadline(phase_budget, move || confirm_phase(target, opts.settle))
@@ -677,6 +696,9 @@ pub fn with_x11_foreground_opts<T>(
     }
     let target_pid = crate::x11::window_pid(xid).or(opts.target_pid);
     let windows_before = pid_window_set(target_pid);
+    // Activation itself is observable. Recheck before irreversible input so
+    // a newly held physical key/button is not mixed into this tool action.
+    primary_x11_input_idle()?;
     let value = body()?;
     // The post-check is what the tool reports as evidence for both keyboard
     // and pointer bodies: a real click that opened a menu or a dialog moves

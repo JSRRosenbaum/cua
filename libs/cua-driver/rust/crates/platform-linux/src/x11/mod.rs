@@ -23,6 +23,85 @@ pub struct WindowInfo {
     pub height: u32,
 }
 
+/// An XWayland client has two unrelated identifiers: Hyprland's CWindow
+/// address and the X server's 32-bit XID. Neither can be substituted for the
+/// other. The plugin supplies the mapping for the exact live compositor
+/// window; X11 and compositor ownership are then checked independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XWaylandTarget {
+    pub address: u64,
+    pub xid: u32,
+    pub pid: u32,
+}
+
+/// Bind an exact native Hyprland window to its XWayland XID without guessing
+/// from a title, process, window position or truncated compositor address.
+/// A production input-enabled plugin must support INSPECT_XWAYLAND; failure
+/// never falls through to a native-seat or global XTest action.
+pub fn validate_hyprland_xwayland(pid: u32, address: u64) -> Result<XWaylandTarget> {
+    anyhow::ensure!(
+        pid != 0 && address != 0,
+        "exact XWayland pid and address required"
+    );
+    let native = crate::wayland::hyprland::window_for_address(address)
+        .ok_or_else(|| anyhow::anyhow!("Hyprland XWayland target is no longer mapped"))?;
+    anyhow::ensure!(
+        native.pid == pid && native.visible,
+        "Hyprland XWayland target is not visible on an active workspace or has a different owner"
+    );
+    let compositor = crate::wayland::hyprland::verified_compositor_pid()?;
+    ensure_xwayland_display(compositor)?;
+    let xid = crate::wayland::hyprland_input::inspect_xwayland(pid, address)?;
+    let xwindow = window_info(u64::from(xid))
+        .ok_or_else(|| anyhow::anyhow!("XWayland XID 0x{xid:x} is no longer mapped"))?;
+    anyhow::ensure!(
+        xid != 0 && xwindow.pid == Some(pid) && xwindow.is_on_screen,
+        "XWayland XID 0x{xid:x} is absent, unviewable, or its X11 owner differs from pid {pid}"
+    );
+    anyhow::ensure!(
+        xwindow.width == native.width && xwindow.height == native.height,
+        "XWayland X11 window size differs from native screenshot size; coordinate mapping is unqualified"
+    );
+    Ok(XWaylandTarget { address, xid, pid })
+}
+
+/// The local DISPLAY must be the Xwayland process owned by the selected
+/// compositor, not an unrelated Xorg/Xpra server whose XIDs happen to collide.
+fn local_display_number(display: &str) -> Result<&str> {
+    display
+        .strip_prefix(':')
+        .and_then(|name| {
+            name.split_once('.').map_or(Some(name), |(number, screen)| {
+                (!screen.is_empty() && screen.bytes().all(|b| b.is_ascii_digit())).then_some(number)
+            })
+        })
+        .filter(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+        .ok_or_else(|| anyhow::anyhow!("XWayland requires a local numeric DISPLAY"))
+}
+
+fn ensure_xwayland_display(compositor_pid: u32) -> Result<()> {
+    let display = std::env::var("DISPLAY")?;
+    let number = local_display_number(&display)?;
+    let lock = std::fs::read_to_string(format!("/tmp/.X{number}-lock"))?;
+    let pid: u32 = lock.trim().parse()?;
+    anyhow::ensure!(pid != 0, "XWayland DISPLAY lock has no process");
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))?;
+    anyhow::ensure!(
+        exe.file_name().and_then(|name| name.to_str()) == Some("Xwayland"),
+        "DISPLAY does not name Xwayland"
+    );
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+    let parent = status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|value| value.trim().parse::<u32>().ok());
+    anyhow::ensure!(
+        parent == Some(compositor_pid),
+        "DISPLAY Xwayland process is not owned by the selected Hyprland compositor"
+    );
+    Ok(())
+}
+
 /// The window the window manager reports as active (`_NET_ACTIVE_WINDOW`
 /// on the root), if any.
 pub fn active_window() -> Option<u64> {
@@ -593,6 +672,15 @@ pub(crate) fn get_window_class(conn: &RustConnection, xid: Window) -> Option<(St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xwayland_display_never_adopts_remote_or_ambiguous_x_server() {
+        assert_eq!(local_display_number(":1").unwrap(), "1");
+        assert_eq!(local_display_number(":12.0").unwrap(), "12");
+        for display in ["host:1", "unix/:1", ":1.foo", ":1.0.2", ":", ":1/0"] {
+            assert!(local_display_number(display).is_err(), "{display}");
+        }
+    }
 
     #[test]
     fn empty_present_client_list_does_not_fall_back_to_query_tree() {

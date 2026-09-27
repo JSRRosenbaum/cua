@@ -271,6 +271,8 @@ const DESKTOP_INPUT_OPERATIONS: &[&str] = &[
     "double_click",
     "right_click",
     "drag",
+    "transfer_data",
+    "set_agent_selection",
     "scroll",
     "move_cursor",
     "mouse_button_down",
@@ -894,6 +896,10 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "set_value"
         | "invoke_menu"
         | "launch_app"
+        | "stop_owned_session"
+        | "transfer_data"
+        | "set_agent_selection"
+        | "clear_agent_selection"
         | "bring_to_front"
         | "set_window_frame"
         | "start_session"

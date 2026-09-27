@@ -44,6 +44,10 @@ fn absolute_existing_file(path: &str) -> Result<String, String> {
 }
 
 impl ClipboardBackend for LinuxClipboard {
+    fn selection_owner(&self) -> Option<&'static str> {
+        Some("driver_process")
+    }
+
     fn available_formats(&self) -> Result<Vec<String>, String> {
         self.context()?
             .available_formats()

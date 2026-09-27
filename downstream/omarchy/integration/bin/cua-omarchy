@@ -1,0 +1,862 @@
+#!/usr/bin/python3
+"""Omarchy's one session-bound Cua service, explicit MCP clients and operator controls.
+
+This file is a package payload, not an instruction to change the current desktop.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+DRIVER = "/usr/bin/cua-driver"
+SERVICE = "cua-driver-omarchy.service"
+OLD_SERVICE = "cua-driver-desktop.service"
+MODULE = Path("/usr/lib/cua/hyprland/cua-hyprland-plugin.so")
+KIT = Path("/usr/share/cua-hyprland-plugin")
+FLAG_SOURCE = Path("/usr/share/cua-omarchy/hypr/cua-input.lua")
+FLAG = Path.home() / ".local/state/omarchy/toggles/hypr/cua-input.lua"
+SERVER_NAME = "cua-omarchy"
+OWNED_COMMAND = "/usr/bin/cua-omarchy"
+MENU_SOURCE = Path("/usr/share/cua-omarchy/menu-items.json")
+MENU_BEGIN = "// cua-omarchy managed begin"
+MENU_END = "// cua-omarchy managed end"
+SESSION_ENV_KEYS = (
+    "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE",
+    "HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    "XDG_STATE_HOME", "DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "XAUTHORITY",
+    "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP",
+)
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def runtime_dir():
+    raw = os.environ.get("XDG_RUNTIME_DIR")
+    if not raw:
+        fail("XDG_RUNTIME_DIR is required; start from the desktop user's session")
+    path = Path(raw)
+    info = path.stat()
+    if not path.is_absolute() or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        fail("XDG_RUNTIME_DIR must be an absolute directory owned by this user")
+    return path / "cua-driver-omarchy"
+
+def private_runtime_dir(create=False):
+    directory = runtime_dir()
+    if create:
+        directory.mkdir(mode=0o700, exist_ok=True)
+    info = directory.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or
+            stat.S_IMODE(info.st_mode) & 0o077):
+        fail(f"{directory} must be a private user-owned directory (0700)")
+    return directory
+
+
+def socket_path():
+    return runtime_dir() / "driver.sock"
+
+
+def run(*argv, check=True):
+    return subprocess.run(argv, text=True, capture_output=True, check=check, timeout=15)
+
+
+def hypr(*argv):
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if argv[-1] != "instances" and not signature:
+        fail("HYPRLAND_INSTANCE_SIGNATURE is required to select the compositor")
+    flags = () if argv[-1] == "instances" else ("-i", signature)
+    return run("hyprctl", *flags, *argv, check=False)
+
+
+def hypr_json(*argv):
+    result = hypr("-j", *argv)
+    if result.returncode:
+        fail(f"hyprctl {' '.join(argv)} failed: {result.stderr.strip() or result.stdout.strip()}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        fail(f"hyprctl {' '.join(argv)} returned invalid JSON: {error}")
+
+
+def module_loaded():
+    plugins = hypr_json("plugin", "list")
+    if not isinstance(plugins, list):
+        fail("hyprctl plugin list returned an unexpected shape")
+    return any(isinstance(item, dict) and item.get("name") == "cua-hyprland-plugin" for item in plugins)
+
+
+def selected_instance():
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    display = os.environ.get("WAYLAND_DISPLAY")
+    if not signature or not display:
+        fail("Hyprland instance and Wayland display must both be selected")
+    instances = hypr_json("instances")
+    matches = [item for item in instances if isinstance(item, dict) and
+               item.get("instance") == signature and item.get("wl_socket") == display]
+    if len(matches) != 1 or not isinstance(matches[0].get("pid"), int):
+        fail("cannot identify the exact running Hyprland instance and Wayland display")
+    return matches[0]
+
+
+def mapped_module_current():
+    """Never trust the package file alone when old module bytes remain mapped."""
+    instance = selected_instance()
+    try:
+        info = MODULE.stat()
+        maps = Path(f"/proc/{instance['pid']}/maps").read_text()
+    except OSError as error:
+        fail(f"cannot compare the installed and mapped Cua module: {error}")
+    for line in maps.splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) < 6 or not fields[5].startswith(str(MODULE)):
+            continue
+        major, minor = fields[3].split(":", 1)
+        if (int(major, 16), int(minor, 16), int(fields[4])) == (
+                os.major(info.st_dev), os.minor(info.st_dev), info.st_ino):
+            return
+    fail("the mapped Cua module differs from the installed file (or is unprovable); log out and back in, never hot-replace it")
+
+
+def compatible_module():
+    if not MODULE.is_file() or not (KIT / "profile_verify.py").is_file():
+        fail("the ABI-pinned Cua Hyprland plugin package is not installed")
+    # The package's verifier is the authority for the exact consumer profile.
+    import hashlib
+    provenance = KIT / "KIT-PROVENANCE.json"
+    try:
+        digest = hashlib.sha256(provenance.read_bytes()).hexdigest()
+    except OSError as error:
+        fail(f"plugin kit provenance unavailable: {error}")
+    result = run("/usr/bin/python3", str(KIT / "profile_verify.py"), "verify-consumer",
+                 "--kit", str(KIT), "--kit-sha256", digest,
+                 "--consumer", str(MODULE), "--compositor", "/usr/bin/Hyprland",
+                 "--driver", DRIVER,
+                 "--driver-provenance", "/usr/share/cua-driver-omarchy/BUILD-PROVENANCE.json",
+                 check=False)
+    if result.returncode:
+        fail("the installed plugin/Driver pair does not match the reviewed compositor/toolchain/runtime; "
+             "review the package consumer check and log in to a fresh compatible session: "
+             + (result.stderr.strip() or result.stdout.strip()))
+
+
+def input_status():
+    status = hypr_json("cua:status")
+    if not isinstance(status, dict):
+        fail("hyprctl cua:status returned an unexpected shape")
+    return status
+
+
+def require_keyboard_capabilities(status):
+    if not (status.get("keyboard_layout_independent") is True and
+            status.get("foreground_numlock_compatible") is True):
+        fail("mapped module lacks the independent-keymap/Num-Lock safety capabilities; "
+             "install the matching patched module and use a fresh login")
+
+
+def owned_flag():
+    if FLAG.is_symlink():
+        fail(f"{FLAG} is a symlink; refusing to overwrite or remove it")
+    if not FLAG.exists():
+        return False
+    if not FLAG.is_file() or FLAG.read_bytes() != FLAG_SOURCE.read_bytes():
+        fail(f"{FLAG} is not our flag; refusing to overwrite or remove it")
+    return True
+
+
+def direct_loader_present():
+    config = Path.home() / ".config/hypr/hyprland.lua"
+    try:
+        contents = config.read_text()
+    except FileNotFoundError:
+        return False
+    return any(line.lstrip().startswith(("hl.plugin.load(", "hl.config({ plugin = { cua"))
+               and ("cua-hyprland-plugin" in line or "cua =" in line)
+               for line in contents.splitlines())
+
+
+def input_on(startup=False):
+    if startup and not owned_flag():
+        return
+    if direct_loader_present():
+        if startup:
+            FLAG.unlink()
+        fail("direct Lua Cua activation is still configured; remove that loader during an explicit "
+             "fresh-login cutover before enabling the packaged Omarchy flag")
+    owned_flag()
+    try:
+        compatible_module()
+        if not module_loaded():
+            result = hypr("plugin", "load", str(MODULE))
+            if result.returncode:
+                fail("Cua plugin load failed; see Hyprland session logs: " + result.stderr.strip())
+        mapped_module_current()
+        require_keyboard_capabilities(input_status())
+        if not startup:
+            FLAG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if not FLAG.exists():
+                FLAG.write_bytes(FLAG_SOURCE.read_bytes())
+        # The plugin reconciles its transport on Hyprland's config-reloaded
+        # event, not merely when the config value changes via keyword.
+        result = hypr("reload")
+        if result.returncode:
+            fail("could not enable Cua plugin input: " + result.stderr.strip())
+        status = input_status()
+        if status.get("configured") is not True or status.get("transport", {}).get("ready") is not True:
+            fail("Cua input is not ready after activation; inspect hyprctl -j cua:status")
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        # A failed startup must not perpetuate its flag or leave native input
+        # live. Reload after removing it: keyword alone does not retire seats.
+        if owned_flag():
+            FLAG.unlink()
+        if module_loaded():
+            stopped = hypr("reload")
+            if stopped.returncode or input_status().get("transport", {}).get("ready") is not False:
+                fail("Cua activation failed and native input could not be proven disabled")
+        raise
+    print("Native Cua input ready; mapped module matched installed package.")
+
+
+def input_off():
+    owned = owned_flag()
+    if direct_loader_present() and not owned:
+        fail("direct Lua activation will re-enable native input; run the explicit "
+             "`cua-omarchy migrate-input-config` cutover before disabling it")
+    loaded = module_loaded()
+    if not owned and not loaded:
+        print("Native Cua input is already absent; service and direct runtimes are unchanged.")
+        return
+    if owned:
+        FLAG.unlink()
+    # Reconciliation and seat retirement run only on config reload. Merely
+    # setting plugin:cua:enabled=0 can leave an input transport live.
+    result = hypr("reload")
+    if result.returncode:
+        fail("Hyprland reload failed; native input state is unknown: " + result.stderr.strip())
+    if loaded:
+        status = input_status()
+        if status.get("configured") is not False or status.get("transport", {}).get("ready") is not False:
+            fail("Cua plugin still exposes input after reload; another config loader exists")
+    print("Native Cua input disabled (module remains mapped until logout). "
+          "Independent semantic/browser or direct runtimes are not stopped.")
+
+def migrate_input_config():
+    """Retire only the two known direct-loader lines; keep a single rollback copy."""
+    config = Path.home() / ".config/hypr/hyprland.lua"
+    before = config.read_bytes()
+    lines = before.splitlines(keepends=True)
+    known = {
+        b'hl.plugin.load("/usr/lib/cua/hyprland/cua-hyprland-plugin.so")',
+        b'hl.config({ plugin = { cua = { enabled = true } } })',
+    }
+    found = [line for line in lines if line.strip() in known]
+    if not found:
+        if direct_loader_present():
+            fail("unrecognized direct Cua loader; inspect it manually rather than modifying user config")
+        print("No known direct Cua loader to migrate.")
+        return
+    if len(found) != 2 or {line.strip() for line in found} != known:
+        fail("direct Cua loader differs from the known two-line installation; leave it untouched")
+    if owned_flag():
+        fail("Omarchy flag already exists; refusing to migrate a second loader in place")
+    # Keep the original bytes for a reversible cutover. After retiring the
+    # loader, reload so the mapped module actually retires its input seats.
+    backup = config.with_name(config.name + ".cua-before-omarchy")
+    with backup.open("xb") as stream:
+        stream.write(before)
+    remove = {i for i, line in enumerate(lines) if line.strip() in known}
+    # This exact comment describes the retired direct loader, not the new flag.
+    first = min(remove)
+    if first and lines[first - 1].strip() == (
+            b"-- Load the ABI-pinned Cua module and enable its local input transport."):
+        remove.add(first - 1)
+    replacement = b"".join(line for i, line in enumerate(lines) if i not in remove)
+    temporary = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix=".hyprland.lua.cua-", dir=config.parent)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(replacement)
+        os.chmod(temporary, stat.S_IMODE(config.stat().st_mode))
+        if config.read_bytes() != before:
+            fail("Hyprland config changed during migration; original and rollback copy were preserved")
+        os.replace(temporary, config)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+    result = hypr("reload")
+    if result.returncode:
+        fail(f"direct loader was removed but Hyprland reload failed; rollback is {backup}")
+    if module_loaded():
+        status = input_status()
+        if status.get("configured") is not False or status.get("transport", {}).get("ready") is not False:
+            fail(f"input remains live after migration; another loader exists. Rollback is {backup}")
+    print(f"Direct Cua loader retired; rollback copy: {backup}. Log out and back in "
+          "before `cua-omarchy input on`; the mapped module was not replaced.")
+
+
+def service_active(name=SERVICE):
+    return run("systemctl", "--user", "is-active", "--quiet", name, check=False).returncode == 0
+
+
+def session_environment():
+    display = os.environ.get("WAYLAND_DISPLAY")
+    if not display or "/" in display:
+        fail("the user service needs a session-local Wayland display name")
+    endpoint = runtime_dir().parent / display
+    if not endpoint.is_socket() or endpoint.stat().st_uid != os.getuid():
+        fail("the selected Wayland socket is absent or not owned by this user")
+    return selected_instance()
+
+
+def current_session_identity():
+    instance = session_environment()
+    endpoint = runtime_dir().parent / os.environ["WAYLAND_DISPLAY"]
+    info = endpoint.stat()
+    return {
+        "environment": {key: os.environ.get(key) for key in SESSION_ENV_KEYS},
+        "compositor_pid": instance["pid"],
+        "wayland_socket_device": info.st_dev,
+        "wayland_socket_inode": info.st_ino,
+    }
+
+
+def manager_session_matches(identity):
+    result = run("systemctl", "--user", "show-environment", "--output=json", check=False)
+    if result.returncode:
+        fail("cannot inspect the graphical user manager's environment")
+    manager = json.loads(result.stdout)
+    if not isinstance(manager, dict):
+        fail("user manager environment has an unexpected shape")
+    mismatched = [key for key, expected in identity["environment"].items()
+                  if manager.get(key) != expected]
+    if mismatched:
+        fail("user manager belongs to a different desktop/profile: " + ", ".join(mismatched) +
+             "; refusing to start or claim its singleton Cua service")
+
+
+def expected_session_path():
+    return runtime_dir() / "expected-session.json"
+
+
+def read_expected_session():
+    path = expected_session_path()
+    if not path.exists() and not path.is_symlink():
+        return None
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        fail("Cua service session binding is not a private regular file")
+    return json.loads(path.read_text())
+
+
+def write_expected_session(identity):
+    private_runtime_dir(create=True)
+    path = expected_session_path()
+    previous = read_expected_session()
+    if previous is not None:
+        if previous != identity:
+            fail("another Cua session binding exists; do not reuse this service endpoint")
+        return False
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+        json.dump(identity, stream, sort_keys=True)
+    return True
+
+
+def attest_socket_owner(identity):
+    pinned = read_expected_session()
+    if pinned is not None and pinned != identity:
+        fail("Cua socket belongs to a different pinned compositor/profile")
+    directory = private_runtime_dir()
+    socket_pathname = socket_path()
+    if not socket_pathname.is_socket():
+        fail(f"the Omarchy Cua service socket is absent: {socket_pathname}; start {SERVICE} in a desktop session")
+    pid = int((directory / "driver.pid").read_text())
+    if pid <= 0:
+        fail("Cua socket has no valid owning process")
+    actual = {}
+    for item in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+        if b"=" in item:
+            key, value = item.split(b"=", 1)
+            actual[key.decode(errors="surrogateescape")] = value.decode(errors="surrogateescape")
+    if any(actual.get(key) != value for key, value in identity["environment"].items()):
+        fail("active Cua service belongs to a different compositor/profile; refusing this endpoint")
+    installed = Path(DRIVER).stat()
+    running = Path(f"/proc/{pid}/exe").stat()
+    if (installed.st_dev, installed.st_ino) != (running.st_dev, running.st_ino):
+        fail("active Cua service executable differs from installed package; use a fresh session")
+    socket = socket_pathname.stat()
+    if not stat.S_ISSOCK(socket.st_mode) or socket.st_uid != os.getuid() or stat.S_IMODE(socket.st_mode) & 0o077:
+        fail("Cua service socket is not private and owned by this user")
+    if service_active():
+        manager_session_matches(identity)
+        result = run("systemctl", "--user", "show", SERVICE, "--property=MainPID", "--value", check=False)
+        if result.returncode or not result.stdout.strip().isdigit() or int(result.stdout.strip()) != pid:
+            fail("Cua socket PID does not match the active systemd-owned service")
+    return pid
+
+
+def attest_active_service(identity):
+    if not service_active():
+        fail("the Omarchy Cua service is not active")
+    attest_socket_owner(identity)
+    sessions_unchecked()
+
+def await_service_ready(identity):
+    deadline = time.monotonic() + 15
+    while True:
+        if service_active() and socket_path().is_socket() and (
+                runtime_dir() / "driver.pid").is_file():
+            # Once an endpoint exists, a foreign process/binding is a security
+            # failure, never a transient readiness condition.
+            attest_socket_owner(identity)
+            try:
+                sessions_unchecked()
+            except RuntimeError as error:
+                if not str(error).startswith("Omarchy service is not responding: "):
+                    raise
+            else:
+                return
+        if time.monotonic() >= deadline:
+            fail(f"{SERVICE} did not expose its bound private endpoint within 15 seconds")
+        time.sleep(0.2)
+
+
+def setup(retire_legacy):
+    """Explicit user-session cutover; never touches unrelated system services."""
+    identity = current_session_identity()
+    manager_session_matches(identity)
+    if service_active():
+        if service_active(OLD_SERVICE):
+            fail("both Cua desktop units are active; inspect and retire only the known legacy unit")
+        attest_active_service(identity)
+        print(f"{SERVICE} is already active for this compositor/profile.")
+        return
+    old_active = service_active(OLD_SERVICE)
+    old_enabled = run("systemctl", "--user", "is-enabled", "--quiet",
+                      OLD_SERVICE, check=False).returncode == 0
+    if (old_active or old_enabled) and not retire_legacy:
+        fail(f"{OLD_SERVICE} is {'active' if old_active else 'enabled'}; rerun `cua-omarchy "
+             "setup --retire-legacy` to deliberately retire this exact service first")
+    if old_active or old_enabled:
+        unit = Path.home() / ".config/systemd/user" / OLD_SERVICE
+        if not unit.is_file() or "ExecStart=%h/.local/bin/cua-driver-desktop serve" not in unit.read_text():
+            fail(f"{OLD_SERVICE} is not the recognized desktop wrapper; refusing to alter it")
+    if run(DRIVER, "status", check=False).returncode == 0 and not old_active:
+        fail("another Cua daemon owns the default endpoint; determine its owner before cutover")
+    run("systemctl", "--user", "daemon-reload")
+    if old_active or old_enabled:
+        run("systemctl", "--user", "disable", "--now", OLD_SERVICE)
+    binding_created = False
+    try:
+        binding_created = write_expected_session(identity)
+        run("systemctl", "--user", "enable", "--now", SERVICE)
+        await_service_ready(identity)
+        manager_session_matches(identity)
+    except (RuntimeError, OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        run("systemctl", "--user", "disable", "--now", SERVICE, check=False)
+        if binding_created and expected_session_path().exists():
+            expected_session_path().unlink()
+        if old_enabled:
+            run("systemctl", "--user", "enable", OLD_SERVICE)
+        if old_active:
+            run("systemctl", "--user", "start", OLD_SERVICE)
+        raise
+    print(f"{SERVICE} active. Old unit file was preserved for rollback; "
+          "its pre-existing MCP clients may still run direct runtimes until explicitly re-registered.")
+
+
+def serve():
+    identity = current_session_identity()
+    if service_active(OLD_SERVICE) or run(DRIVER, "status", check=False).returncode == 0:
+        fail("another desktop Cua service owns the default endpoint; retire only its known "
+             "unit through explicit setup before starting this service")
+    private_runtime_dir(create=True)
+    expected = read_expected_session()
+    if expected is not None and expected != identity:
+        fail("Cua service startup selected a different compositor/profile than its explicit setup binding")
+    for key in ("CUA_DRIVER_RS_MCP_HTTP_PORT", "CUA_DRIVER_RS_MCP_HTTP_TOKEN",
+                "CUA_DRIVER_ENVELOPE_HTTP_PORT", "CUA_DRIVER_ENVELOPE_PERMISSION_MODE",
+                "CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS", "CUA_DRIVER_EMBEDDED"):
+        os.environ.pop(key, None)
+    os.environ["CUA_DRIVER_PERMISSION_MODE"] = "standard"
+    os.environ["CUA_DRIVER_RS_ENABLE_WAYLAND"] = "1"
+    os.execv(DRIVER, [DRIVER, "serve", "--permission-mode", "standard",
+                      "--socket", str(socket_path()),
+                      "--pid-file", str(private_runtime_dir() / "driver.pid")])
+
+
+def mcp():
+    attest_socket_owner(current_session_identity())
+    os.execv(DRIVER, [DRIVER, "mcp", "--socket", str(socket_path())])
+
+
+def sessions():
+    attest_socket_owner(current_session_identity())
+    return sessions_unchecked()
+
+
+def sessions_unchecked():
+    result = run(DRIVER, "sessions", "list", "--json", "--socket", str(socket_path()), check=False)
+    if result.returncode:
+        fail("Omarchy service is not responding: " + (result.stderr.strip() or result.stdout.strip()))
+    data = json.loads(result.stdout)
+    if not isinstance(data.get("sessions"), list):
+        fail("Cua sessions list returned an unexpected shape")
+    return data
+
+
+def status():
+    active = service_active()
+    try:
+        listing = sessions()
+        daemon = True
+        reason = None
+    except (RuntimeError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        listing = None
+        daemon = False
+        reason = str(error)
+    try:
+        plugin = input_status() if module_loaded() else None
+        plugin_error = None
+    except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+        plugin = None
+        plugin_error = str(error)
+    session_matches = None
+    identity_error = None
+    if active:
+        try:
+            identity = current_session_identity()
+            manager_session_matches(identity)
+            attest_active_service(identity)
+            session_matches = True
+        except (RuntimeError, OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as error:
+            session_matches = False
+            identity_error = str(error)
+    print(json.dumps({"service_active": active,
+                      "service_matches_current_session": session_matches,
+                      "identity_error": identity_error,
+                      "legacy_service_active": service_active(OLD_SERVICE),
+                      "daemon_reachable": daemon,
+                      "socket": str(socket_path()), "sessions": listing,
+                      "service_error": reason, "plugin": plugin, "plugin_error": plugin_error,
+                      "other_direct_runtimes": "not enumerated or revoked by this service"},
+                     indent=2))
+
+
+def revoke_one(label):
+    if not label:
+        fail("revoke-one needs a nonempty public session label")
+    rows = sessions()["sessions"]
+    # The driver's operator revoke uses a public label, not a transport-owner id.
+    # A label shared by multiple connections cannot be selected unambiguously.
+    matches = [row for row in rows if row.get("session") == label and row.get("state") == "active"]
+    if len(matches) != 1:
+        fail(f"session label {label!r} has {len(matches)} active owners; revoke-one requires "
+             "exactly one; use explicit revoke-all only if intended")
+    attest_socket_owner(current_session_identity())
+    result = run(DRIVER, "revoke", "--session", label, "--socket", str(socket_path()), check=False)
+    if result.returncode:
+        fail(result.stderr.strip() or result.stdout.strip())
+    print(result.stdout.strip())
+
+
+def revoke_all():
+    attest_socket_owner(current_session_identity())
+    result = run(DRIVER, "revoke", "--all", "--socket", str(socket_path()), check=False)
+    if result.returncode:
+        fail(result.stderr.strip() or result.stdout.strip())
+    print(result.stdout.strip())
+    print("This service generation is latched revoked. Restart it only after explicit approval; "
+          "direct runtimes and native compositor input are not disabled.")
+
+
+def owned_server(entry):
+    return (isinstance(entry, dict) and entry.get("command") == OWNED_COMMAND and
+            entry.get("args") == ["mcp"] and not entry.get("url") and not entry.get("env"))
+
+
+def register_codex(remove=False):
+    existing = run("codex", "mcp", "get", SERVER_NAME, "--json", check=False)
+    if existing.returncode == 0:
+        data = json.loads(existing.stdout)
+        transport = data.get("transport", {})
+        if not (transport.get("type") == "stdio" and owned_server(transport) and
+                data.get("enabled") is True):
+            fail("Codex has a foreign or modified cua-omarchy MCP entry; leaving it unchanged")
+        if remove:
+            run("codex", "mcp", "remove", SERVER_NAME)
+        return
+    if "No MCP server named" not in existing.stderr:
+        fail("Could not inspect Codex MCP entry: " + (existing.stderr.strip() or existing.stdout.strip()))
+    if not remove:
+        sessions()
+        run("codex", "mcp", "add", SERVER_NAME, "--", OWNED_COMMAND, "mcp")
+
+
+def register_claude(remove=False):
+    # Claude's user-scope CLI stores entries in ~/.claude.json. Inspect the exact
+    # entry before calling its own CLI so a foreign name is never replaced.
+    config = Path.home() / ".claude.json"
+    data = json.loads(config.read_text()) if config.exists() else {}
+    servers = data.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        fail("Claude user MCP configuration has an unexpected shape")
+    entry = servers.get(SERVER_NAME)
+    if entry is not None:
+        if not owned_server(entry):
+            fail("Claude user config has a foreign cua-omarchy entry; leaving it unchanged")
+        if remove:
+            run("claude", "mcp", "remove", "--scope", "user", SERVER_NAME)
+        return
+    if not remove:
+        sessions()
+        run("claude", "mcp", "add", "--scope", "user", SERVER_NAME, "--", OWNED_COMMAND, "mcp")
+
+
+def register_hermes(remove=False):
+    try:
+        import yaml
+    except ImportError:
+        fail("Hermes registration needs python-yaml to inspect existing entries safely")
+    config = Path.home() / ".hermes/config.yaml"
+    data = yaml.safe_load(config.read_text()) if config.exists() else {}
+    servers = (data or {}).get("mcp_servers", {})
+    if not isinstance(servers, dict):
+        fail("Hermes MCP configuration has an unexpected shape")
+    entry = servers.get(SERVER_NAME)
+    if entry is not None:
+        if not owned_server(entry):
+            fail("Hermes has a foreign cua-omarchy MCP entry; leaving it unchanged")
+        if remove:
+            run("hermes", "mcp", "remove", SERVER_NAME)
+        return
+    if not remove:
+        sessions()
+        result = subprocess.run(("hermes", "mcp", "add", SERVER_NAME, "--command",
+                                 OWNED_COMMAND, "--args", "mcp"), input="y\n",
+                                capture_output=True, text=True, timeout=60)
+        if result.returncode:
+            fail("Hermes registration failed: " + (result.stderr.strip() or result.stdout.strip()))
+        updated = yaml.safe_load(config.read_text()) if config.exists() else {}
+        saved = (updated or {}).get("mcp_servers", {}).get(SERVER_NAME)
+        if not owned_server(saved) or saved.get("enabled", True) is not True:
+            fail("Hermes did not save an active Cua MCP entry; start the service and register again")
+
+
+def parse_jsonc(text):
+    """Parse the supported Omarchy JSONC syntax without rewriting user text."""
+    out = []
+    quoted = escaped = line_comment = block_comment = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+                out.append(char)
+            else:
+                out.append(" ")
+        elif block_comment:
+            if char == "*" and following == "/":
+                out.extend((" ", " "))
+                index += 1
+                block_comment = False
+            else:
+                out.append("\n" if char == "\n" else " ")
+        elif quoted:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+            out.append(char)
+        elif char == "/" and following in ("/", "*"):
+            line_comment = following == "/"
+            block_comment = following == "*"
+            out.extend((" ", " "))
+            index += 1
+        else:
+            out.append(char)
+        index += 1
+    if quoted or block_comment:
+        fail("Omarchy menu JSONC has an unterminated string or comment")
+    clean = "".join(out)
+    # JSONC permits dangling commas. Ignore only commas outside JSON strings.
+    out = list(clean)
+    quoted = escaped = False
+    for index, char in enumerate(clean):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char == ",":
+            following = index + 1
+            while following < len(clean) and clean[following].isspace():
+                following += 1
+            if following < len(clean) and clean[following] in "}]":
+                out[index] = " "
+    return json.loads("".join(out)), clean
+
+
+def menu_entries():
+    entries = json.loads(MENU_SOURCE.read_text())
+    if not isinstance(entries, dict) or not entries:
+        fail("packaged Omarchy menu entries are unavailable")
+    return entries
+
+
+def change_menu(remove=False):
+    target = Path.home() / ".config/omarchy/extensions/omarchy-menu.jsonc"
+    if target.is_symlink():
+        fail(f"{target} is a symlink; leaving the foreign menu configuration untouched")
+    original = target.read_text() if target.exists() else "{}\n"
+    parsed, clean = parse_jsonc(original)
+    if not isinstance(parsed, dict):
+        fail("Omarchy user menu extension must be a JSONC object")
+    entries = menu_entries()
+    start = original.find(MENU_BEGIN)
+    end = original.find(MENU_END)
+    if start != -1 or end != -1:
+        values = ",\n".join(f"  {json.dumps(key)}: {json.dumps(value, ensure_ascii=False)}"
+                            for key, value in entries.items())
+        managed_body = original[start + len(MENU_BEGIN):end] if start >= 0 and end >= 0 else ""
+        if (original.count(MENU_BEGIN) != 1 or original.count(MENU_END) != 1 or
+                end <= start or any(parsed.get(key) != value for key, value in entries.items()) or
+                managed_body not in (f"\n{values}\n  ", f"\n,{values}\n  ")):
+            fail("managed Cua menu block was edited; refusing to overwrite foreign changes")
+        if not remove:
+            return
+        # The generated block begins with a newline, and its optional
+        # separator comma is inside the block. Validate the result before
+        # committing it so subsequent user entries cannot be broken.
+        begin = original.rfind("\n", 0, start)
+        finish = original.find("\n", end)
+        if begin < 0 or finish < 0:
+            fail("managed Cua menu block boundaries were changed")
+        candidate = original[:begin] + original[finish + 1:]
+    elif remove:
+        return
+    else:
+        if any(key in parsed for key in entries):
+            fail("Omarchy menu already has a foreign Cua entry; leaving it unchanged")
+        closing = clean.rfind("}")
+        if closing < 0 or clean[closing + 1:].strip():
+            fail("Omarchy menu JSONC does not end in a root object")
+        previous = closing - 1
+        while previous >= 0 and clean[previous].isspace():
+            previous -= 1
+        separator = "" if previous >= 0 and clean[previous] in "{," else ","
+        values = ",\n".join(f"  {json.dumps(key)}: {json.dumps(value, ensure_ascii=False)}"
+                            for key, value in entries.items())
+        block = f"\n  {MENU_BEGIN}\n{separator}{values}\n  {MENU_END}\n"
+        candidate = original[:closing] + block + original[closing:]
+    decoded, _ = parse_jsonc(candidate)
+    if not isinstance(decoded, dict):
+        fail("Cua menu change would not produce a JSONC object")
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".omarchy-menu-cua-", dir=target.parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(candidate)
+        if target.exists():
+            os.chmod(temporary, stat.S_IMODE(target.stat().st_mode))
+            if target.read_text() != original:
+                fail("Omarchy menu changed concurrently; leaving it untouched")
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def prompt_revoke(all_sessions):
+    if not sys.stdin.isatty():
+        fail("the Omarchy menu revoke prompt requires an interactive terminal")
+    if all_sessions:
+        answer = subprocess.run(("gum", "confirm", "Revoke all sessions of this Cua service?"),
+                                check=False).returncode
+        if answer:
+            print("No sessions revoked.")
+            return
+        revoke_all()
+    else:
+        answer = subprocess.run(("gum", "input", "--placeholder", "Public Cua session label"),
+                                text=True, capture_output=True, check=False)
+        label = answer.stdout.strip()
+        if answer.returncode or not label:
+            print("No session revoked.")
+            return
+        revoke_one(label)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    subs = parser.add_subparsers(dest="action", required=True)
+    for action in ("serve", "mcp", "status", "sessions", "revoke-all",
+                   "revoke-one-prompt", "revoke-all-prompt",
+                   "disable-input", "migrate-input-config"):
+        subs.add_parser(action)
+    menu = subs.add_parser("menu")
+    menu.add_argument("mode", choices=("install", "remove"))
+    setup_parser = subs.add_parser("setup")
+    setup_parser.add_argument("--retire-legacy", action="store_true")
+    revoke = subs.add_parser("revoke-one")
+    revoke.add_argument("session")
+    toggle = subs.add_parser("input")
+    toggle.add_argument("mode", choices=("on", "off", "load"))
+    for action in ("register", "unregister"):
+        selected = subs.add_parser(action)
+        selected.add_argument("agent", choices=("codex", "claude", "hermes"))
+    args = parser.parse_args()
+    if args.action == "serve":
+        serve()
+    elif args.action == "setup":
+        setup(args.retire_legacy)
+    elif args.action == "migrate-input-config":
+        migrate_input_config()
+    elif args.action == "mcp":
+        mcp()
+    elif args.action == "status":
+        status()
+    elif args.action == "sessions":
+        print(json.dumps(sessions(), indent=2))
+    elif args.action == "revoke-one":
+        revoke_one(args.session)
+    elif args.action == "revoke-all":
+        revoke_all()
+    elif args.action == "revoke-one-prompt":
+        prompt_revoke(False)
+    elif args.action == "revoke-all-prompt":
+        prompt_revoke(True)
+    elif args.action == "menu":
+        change_menu(remove=args.mode == "remove")
+    elif args.action == "disable-input":
+        input_off()
+    elif args.action == "input":
+        input_on(startup=True) if args.mode == "load" else (input_on() if args.mode == "on" else input_off())
+    elif args.action in ("register", "unregister"):
+        {"codex": register_codex, "claude": register_claude,
+         "hermes": register_hermes}[args.agent](remove=args.action == "unregister")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as error:
+        print(f"cua-omarchy: {error}", file=sys.stderr)
+        sys.exit(1)

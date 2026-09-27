@@ -2,10 +2,15 @@
 //!
 //! Native IDs are full compositor addresses, never title matches or truncated
 //! protocol object IDs. IPC and capture must belong to the same compositor.
+//!
+//! Powered-output framing adapts CARLOSDAVID33's #4217; finite positive
+//! fractional-scale logical sizing adapts lorenzozanee's #4244; rotated
+//! logical axes adapt Osamah Beig's #3969. The combined per-output capture,
+//! gap refusal, and capture-bound layout validation are downstream integration.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -43,16 +48,114 @@ struct Monitor {
     active_workspace: Workspace,
     #[serde(rename = "specialWorkspace")]
     special_workspace: Workspace,
+    #[serde(rename = "dpmsStatus", default = "powered_by_default")]
+    dpms_status: bool,
+    #[serde(default)]
+    disabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct DisplayMonitor {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    id: Option<i64>,
     width: u32,
     height: u32,
     scale: f64,
     x: i32,
     y: i32,
     transform: u32,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(rename = "dpmsStatus", default = "powered_by_default")]
+    dpms_status: bool,
+}
+
+fn powered_by_default() -> bool {
+    true
+}
+
+impl DisplayMonitor {
+    fn powered(&self) -> bool {
+        !self.disabled && self.dpms_status
+    }
+}
+
+/// A powered output's logical rectangle and its physical screenshot transform.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameOutput {
+    pub name: String,
+    pub(crate) id: Option<i64>,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub(crate) native_width: u32,
+    pub(crate) native_height: u32,
+    pub(crate) scale_bits: u64,
+    pub(crate) transform: u32,
+}
+
+/// The screenshot/action frame is the bounding rectangle of powered outputs.
+/// Output gaps have pixels in the image but are never valid action points.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesktopFrame {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub outputs: Vec<FrameOutput>,
+}
+/// Layout and compositor scene observed across a single desktop PNG capture.
+/// Inventory can be absent only when native input inspection is unavailable.
+#[derive(Clone, Debug)]
+pub struct CapturedDesktop {
+    pub frame: DesktopFrame,
+    pub inventory: Option<super::hyprland_input::FrameInventory>,
+}
+
+/// Root-surface proof paired with a window-local export. Inventory includes
+/// native and XWayland roots; XWayland additionally pins its exact XID so
+/// foreground routing cannot substitute a newly mapped X client.
+#[derive(Clone, Debug)]
+pub struct CapturedWindowScene {
+    pub inventory: Option<super::hyprland_input::FrameInventory>,
+    pub xwayland: Option<super::hyprland_input::XWaylandCaptureProof>,
+}
+
+impl DesktopFrame {
+    pub fn from_layout(&self, x: i32, y: i32) -> (i64, i64) {
+        (
+            i64::from(x) - i64::from(self.x),
+            i64::from(y) - i64::from(self.y),
+        )
+    }
+
+    /// Translate only screenshot points on a powered output; do not clamp a
+    /// gap or out-of-bounds point into an adjacent monitor.
+    pub fn to_layout(&self, x: f64, y: f64) -> Result<(f64, f64)> {
+        if !x.is_finite()
+            || !y.is_finite()
+            || x < 0.0
+            || y < 0.0
+            || x >= f64::from(self.width)
+            || y >= f64::from(self.height)
+        {
+            bail!("desktop frame point is outside powered output bounds");
+        }
+        let layout_x = f64::from(self.x) + x;
+        let layout_y = f64::from(self.y) + y;
+        if !self.outputs.iter().any(|output| {
+            layout_x >= f64::from(output.x)
+                && layout_x < f64::from(output.x) + f64::from(output.width)
+                && layout_y >= f64::from(output.y)
+                && layout_y < f64::from(output.y) + f64::from(output.height)
+        }) {
+            bail!("desktop frame point falls in an output gap or DPMS-off region");
+        }
+        Ok((layout_x, layout_y))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,7 +170,7 @@ pub struct Window {
     pub height: u32,
     pub workspace: i64,
     pub visible: bool,
-    hidden: bool,
+    pub(crate) hidden: bool,
 }
 
 pub fn is_session() -> bool {
@@ -310,34 +413,470 @@ fn valid_dimensions(width: u32, height: u32) -> bool {
     width > 0 && height > 0 && u64::from(width) * u64::from(height) <= MAX_LOGICAL_PIXELS
 }
 
-/// Content-free geometry for the qualified single-output, 1:1 desktop.
-/// The common policy adapter uses this for display-scoped observation. Never
-/// substitute a screenshot, XWayland root, or guessed primary monitor here.
+/// Content-free logical geometry of the powered desktop action frame.
+/// Different outputs may have different physical scales; this frame is 1:1.
 pub fn screen_size() -> Result<(u32, u32, f64)> {
     screen_size_from_monitors(query("j/monitors")?)
 }
 
 fn screen_size_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<(u32, u32, f64)> {
-    let [monitor] = monitors.as_slice() else {
-        bail!("Hyprland display identity requires exactly one active output");
-    };
-    if monitor.scale != 1.0 || monitor.transform != 0 || monitor.x != 0 || monitor.y != 0 {
-        bail!("Hyprland display identity requires an unscaled, unrotated output at the origin");
+    let frame = desktop_frame_from_monitors(monitors)?;
+    Ok((frame.width, frame.height, 1.0))
+}
+
+fn logical_output_size(monitor: &DisplayMonitor) -> Result<(u32, u32)> {
+    if !monitor.scale.is_finite() || monitor.scale <= 0.0 || monitor.transform > 7 {
+        bail!("invalid Hyprland output scale or transform");
     }
     if !valid_dimensions(monitor.width, monitor.height) {
-        bail!("invalid Hyprland display dimensions");
+        bail!("invalid Hyprland physical output dimensions");
     }
-    Ok((monitor.width, monitor.height, monitor.scale))
+    let (width, height) = if monitor.transform % 2 == 1 {
+        (monitor.height, monitor.width)
+    } else {
+        (monitor.width, monitor.height)
+    };
+    let width = (f64::from(width) / monitor.scale).round();
+    let height = (f64::from(height) / monitor.scale).round();
+    if !width.is_finite()
+        || !height.is_finite()
+        || !(1.0..=f64::from(u32::MAX)).contains(&width)
+        || !(1.0..=f64::from(u32::MAX)).contains(&height)
+    {
+        bail!("invalid Hyprland logical output dimensions");
+    }
+    let (width, height) = (width as u32, height as u32);
+    if !valid_dimensions(width, height) {
+        bail!("invalid Hyprland logical output dimensions");
+    }
+    Ok((width, height))
+}
+
+fn bounding_box(outputs: &[FrameOutput]) -> Result<(i32, i32, u32, u32)> {
+    let min_x = outputs
+        .iter()
+        .map(|o| i64::from(o.x))
+        .min()
+        .context("no outputs")?;
+    let min_y = outputs
+        .iter()
+        .map(|o| i64::from(o.y))
+        .min()
+        .context("no outputs")?;
+    let max_x = outputs
+        .iter()
+        .map(|o| i64::from(o.x) + i64::from(o.width))
+        .max()
+        .unwrap();
+    let max_y = outputs
+        .iter()
+        .map(|o| i64::from(o.y) + i64::from(o.height))
+        .max()
+        .unwrap();
+    let width = u32::try_from(max_x - min_x)?;
+    let height = u32::try_from(max_y - min_y)?;
+    if !valid_dimensions(width, height)
+        || max_x > i64::from(i32::MAX) + 1
+        || max_y > i64::from(i32::MAX) + 1
+    {
+        bail!("invalid Hyprland desktop frame dimensions");
+    }
+    Ok((i32::try_from(min_x)?, i32::try_from(min_y)?, width, height))
+}
+
+fn output_from_monitor(monitor: DisplayMonitor) -> Result<FrameOutput> {
+    let (width, height) = logical_output_size(&monitor)?;
+    Ok(FrameOutput {
+        name: monitor.name,
+        id: monitor.id,
+        x: monitor.x,
+        y: monitor.y,
+        width,
+        height,
+        native_width: monitor.width,
+        native_height: monitor.height,
+        scale_bits: monitor.scale.to_bits(),
+        transform: monitor.transform,
+    })
+}
+
+fn desktop_frame_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<DesktopFrame> {
+    let mut outputs: Vec<_> = monitors
+        .into_iter()
+        .filter(DisplayMonitor::powered)
+        .map(output_from_monitor)
+        .collect::<Result<_>>()?;
+    if outputs.is_empty() {
+        bail!("Hyprland has no powered output (disabled or DPMS standby)");
+    }
+    outputs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    for (index, output) in outputs.iter().enumerate() {
+        if output.name.is_empty()
+            || outputs[..index].iter().any(|other| {
+                other.name == output.name
+                    || i64::from(other.x) < i64::from(output.x) + i64::from(output.width)
+                        && i64::from(output.x) < i64::from(other.x) + i64::from(other.width)
+                        && i64::from(other.y) < i64::from(output.y) + i64::from(output.height)
+                        && i64::from(output.y) < i64::from(other.y) + i64::from(other.height)
+            })
+        {
+            bail!("Hyprland outputs have ambiguous names or overlapping logical geometry");
+        }
+    }
+    let (x, y, width, height) = bounding_box(&outputs)?;
+    Ok(DesktopFrame {
+        x,
+        y,
+        width,
+        height,
+        outputs,
+    })
+}
+
+pub fn desktop_frame() -> Result<DesktopFrame> {
+    desktop_frame_from_monitors(query("j/monitors")?)
+}
+
+/// Screen points are frame-relative; popup/window coordinates are separate.
+pub fn frame_point_to_layout(x: f64, y: f64) -> Result<(f64, f64)> {
+    desktop_frame()?.to_layout(x, y)
+}
+
+/// Virtual-pointer absolute motion spans enabled outputs, even DPMS-off ones.
+fn pointer_layout_from_monitors(monitors: Vec<DisplayMonitor>) -> Result<(i32, i32, u32, u32)> {
+    let outputs: Vec<_> = monitors
+        .into_iter()
+        .filter(|monitor| !monitor.disabled)
+        .map(output_from_monitor)
+        .collect::<Result<_>>()?;
+    bounding_box(&outputs)
+}
+
+pub fn pointer_layout() -> Result<(i32, i32, u32, u32)> {
+    pointer_layout_from_monitors(query("j/monitors")?)
+}
+
+pub fn monitor_report() -> Result<serde_json::Value> {
+    let monitors: Vec<DisplayMonitor> = query("j/monitors")?;
+    let frame = desktop_frame_from_monitors(monitors.clone())?;
+    Ok(serde_json::Value::Array(
+        monitors
+            .into_iter()
+            .filter(|m| !m.disabled)
+            .map(|m| {
+                let (fx, fy) = frame.from_layout(m.x, m.y);
+                let powered = m.powered();
+                let logical = logical_output_size(&m);
+                serde_json::json!({
+                    "name": m.name,
+                    "width": logical.as_ref().ok().map(|v| v.0),
+                    "height": logical.as_ref().ok().map(|v| v.1),
+                    "scale": m.scale,
+                    "transform": m.transform,
+                    "powered": powered,
+                    "frame_x": powered.then_some(fx),
+                    "frame_y": powered.then_some(fy),
+                })
+            })
+            .collect(),
+    ))
+}
+
+pub fn cursor_position() -> Result<(i32, i32)> {
+    #[derive(Deserialize)]
+    struct CursorPos {
+        x: f64,
+        y: f64,
+    }
+    let pos: CursorPos = query("j/cursorpos")?;
+    if !pos.x.is_finite() || !pos.y.is_finite() {
+        bail!("invalid Hyprland cursor coordinates");
+    }
+    Ok((pos.x.round() as i32, pos.y.round() as i32))
+}
+
+/// `grim -s 1` composes/rotates each wl_output into its logical orientation
+/// before encoding. Do not rotate its PNG a second time (see grim render.c).
+fn validate_output_png(png: &[u8], output: &FrameOutput) -> Result<()> {
+    let (width, height) = cua_driver_core::image_utils::png_dimensions(png)?;
+    if (width, height) != (output.width, output.height) {
+        bail!(
+            "Hyprland output {} screenshot is {}x{}, expected logical {}x{}",
+            output.name,
+            width,
+            height,
+            output.width,
+            output.height
+        );
+    }
+    Ok(())
+}
+
+fn composite_output_png(
+    canvas: &mut image::RgbaImage,
+    frame: &DesktopFrame,
+    output: &FrameOutput,
+    png: &[u8],
+) -> Result<()> {
+    validate_output_png(png, output)?;
+    let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)?.to_rgba8();
+    let (left, top) = frame.from_layout(output.x, output.y);
+    image::imageops::replace(canvas, &image, left, top);
+    Ok(())
+}
+
+fn capture_scene_unchanged(
+    before: &Option<super::hyprland_input::FrameInventory>,
+    after: &Option<super::hyprland_input::FrameInventory>,
+    frame: &DesktopFrame,
+    live_frame: &DesktopFrame,
+) -> Result<()> {
+    if before != after || frame != live_frame {
+        bail!("Hyprland scene or output geometry changed during capture; refresh screenshot");
+    }
+    Ok(())
+}
+
+pub fn capture_desktop_frame_png_with_geometry() -> Result<(Vec<u8>, CapturedDesktop)> {
+    // Verify the two independently connected sockets name the same process;
+    // a subprocess capture must not silently use an unrelated Wayland session.
+    let connection = wayland_connection()?;
+    verify_capture_peer(&connection)?;
+    let before = super::hyprland_input::frame_inventory_if_available()?;
+    let frame = desktop_frame()?;
+    let mut canvas =
+        image::RgbaImage::from_pixel(frame.width, frame.height, image::Rgba([0, 0, 0, 255]));
+    for output in &frame.outputs {
+        let captured = std::process::Command::new("timeout")
+            .args([
+                "--signal=KILL",
+                "5s",
+                "grim",
+                "-s",
+                "1",
+                "-t",
+                "png",
+                "-o",
+                output.name.as_str(),
+                "-",
+            ])
+            .output()
+            .context("bounded grim capture requires coreutils timeout and grim")?;
+        if !captured.status.success() || captured.stdout.is_empty() {
+            bail!(
+                "grim could not capture powered output {}: {}",
+                output.name,
+                String::from_utf8_lossy(&captured.stderr)
+            );
+        }
+        composite_output_png(&mut canvas, &frame, output, &captured.stdout)?;
+    }
+    let after = super::hyprland_input::frame_inventory_if_available()?;
+    capture_scene_unchanged(&before, &after, &frame, &desktop_frame()?)?;
+    verify_capture_peer(&connection)?;
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(canvas).write_to(&mut encoded, image::ImageFormat::Png)?;
+    Ok((
+        encoded.into_inner(),
+        CapturedDesktop {
+            frame,
+            inventory: before,
+        },
+    ))
+}
+
+pub fn capture_desktop_frame_png() -> Result<Vec<u8>> {
+    Ok(capture_desktop_frame_png_with_geometry()?.0)
+}
+
+fn active_workspace_ids(monitors: Vec<Monitor>) -> HashSet<i64> {
+    monitors
+        .into_iter()
+        .filter(|monitor| !monitor.disabled && monitor.dpms_status)
+        .flat_map(|monitor| [monitor.active_workspace.id, monitor.special_workspace.id])
+        .filter(|id| *id != 0)
+        .collect()
 }
 
 pub fn list_windows() -> Result<Vec<Window>> {
-    let monitors: Vec<Monitor> = query("j/monitors")?;
-    let active = monitors
-        .into_iter()
-        .flat_map(|m| [m.active_workspace.id, m.special_workspace.id])
-        .filter(|id| *id != 0)
-        .collect();
+    let active = active_workspace_ids(query("j/monitors")?);
     windows_from_clients(query("j/clients")?, &active)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetKind {
+    Native,
+    XWayland,
+}
+/// No mapped client has this exact compositor address. A mapped address
+/// owned by another PID is an identity conflict, not absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetAbsent;
+
+impl std::fmt::Display for TargetAbsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Hyprland target no longer exists")
+    }
+}
+
+impl std::error::Error for TargetAbsent {}
+
+#[derive(Deserialize)]
+struct ClientKind {
+    address: String,
+    pid: i64,
+    mapped: bool,
+    // Required: absent metadata must never silently classify an XWayland
+    // client as native input compatible.
+    xwayland: bool,
+}
+
+fn target_kind_from_clients(
+    clients: Vec<ClientKind>,
+    pid: u32,
+    address: u64,
+) -> Result<TargetKind> {
+    let mut found = None;
+    for client in clients {
+        if !client.mapped {
+            continue;
+        }
+        let observed = u64::from_str_radix(
+            client.address.strip_prefix("0x").unwrap_or(&client.address),
+            16,
+        )?;
+        if observed == address {
+            if found.is_some() || client.pid != i64::from(pid) {
+                bail!("Hyprland native target identity is ambiguous or belongs to another PID");
+            }
+            found = Some(if client.xwayland {
+                TargetKind::XWayland
+            } else {
+                TargetKind::Native
+            });
+        }
+    }
+    found.ok_or_else(|| anyhow::Error::new(TargetAbsent))
+}
+
+/// Re-read exact compositor identity before selecting native or XWayland route.
+pub fn target_kind(pid: u32, address: u64) -> Result<TargetKind> {
+    target_kind_from_clients(query("j/clients")?, pid, address)
+}
+
+/// An exact layer-shell surface, not an application window. The namespace is
+/// client-declared, so it cannot prove a protected/authentication role.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerTarget {
+    pub address: u64,
+    pub namespace: String,
+    pub monitor: String,
+    pub level: u8,
+    pub x: i64,
+    pub y: i64,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Deserialize)]
+struct LayerReport {
+    levels: HashMap<String, Vec<LayerData>>,
+}
+
+#[derive(Deserialize)]
+struct LayerData {
+    address: String,
+    namespace: String,
+    // HyprCtl.cpp emits m_geometry after layer arrangement has already
+    // positioned it in compositor-global logical coordinates.
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+fn layer_at_from_reports(
+    frame: &DesktopFrame,
+    layers: &HashMap<String, LayerReport>,
+    x: i32,
+    y: i32,
+) -> Result<Option<LayerTarget>> {
+    frame.to_layout(
+        (i64::from(x) - i64::from(frame.x)) as f64,
+        (i64::from(y) - i64::from(frame.y)) as f64,
+    )?;
+    let output = frame
+        .outputs
+        .iter()
+        .find(|output| {
+            i64::from(output.x) <= i64::from(x)
+                && i64::from(x) < i64::from(output.x) + i64::from(output.width)
+                && i64::from(output.y) <= i64::from(y)
+                && i64::from(y) < i64::from(output.y) + i64::from(output.height)
+        })
+        .context("layer point is outside powered output geometry")?;
+    let report = layers
+        .get(&output.name)
+        .context("Hyprland layer inventory omits the selected powered output")?;
+    let mut highest: Option<LayerTarget> = None;
+    for (level, entries) in &report.levels {
+        let level: u8 = level.parse().context("invalid Hyprland layer level")?;
+        if level > 3 {
+            bail!("unsupported Hyprland layer level");
+        }
+        for layer in entries {
+            let width = u32::try_from(layer.w).context("invalid Hyprland layer width")?;
+            let height = u32::try_from(layer.h).context("invalid Hyprland layer height")?;
+            if width == 0 || height == 0 {
+                continue;
+            }
+            let left = i64::from(layer.x);
+            let top = i64::from(layer.y);
+            if i64::from(x) < left
+                || i64::from(x) >= left + i64::from(width)
+                || i64::from(y) < top
+                || i64::from(y) >= top + i64::from(height)
+            {
+                continue;
+            }
+            let address = u64::from_str_radix(
+                layer.address.strip_prefix("0x").unwrap_or(&layer.address),
+                16,
+            )?;
+            if address == 0 {
+                bail!("invalid Hyprland layer identity");
+            }
+            let candidate = LayerTarget {
+                address,
+                namespace: layer.namespace.clone(),
+                monitor: output.name.clone(),
+                level,
+                x: left,
+                y: top,
+                width,
+                height,
+            };
+            if highest.as_ref().is_some_and(|prior| prior.level == level) {
+                bail!("overlapping Hyprland layers at the same level are ambiguous");
+            }
+            if highest.as_ref().is_none_or(|prior| level > prior.level) {
+                highest = Some(candidate);
+            }
+        }
+    }
+    Ok(highest)
+}
+
+/// Observe a layer at a compositor-global logical point. This never turns a
+/// layer into an app PID or claims its client namespace is a protected role.
+pub fn layer_at(x: i32, y: i32) -> Result<Option<LayerTarget>> {
+    let frame = desktop_frame()?;
+    let layers = query("j/layers")?;
+    let layer = layer_at_from_reports(&frame, &layers, x, y)?;
+    if frame != desktop_frame()? {
+        bail!("Hyprland output geometry changed during layer observation");
+    }
+    Ok(layer)
 }
 
 pub fn window_for_address(address: u64) -> Option<Window> {
@@ -374,16 +913,49 @@ pub fn window_for_pid(pid: u32) -> Option<Window> {
     owned.next().is_none().then_some(first)
 }
 
+/// Process identity attested independently over Wayland and Hyprland IPC.
+pub(crate) fn verified_compositor_pid() -> Result<u32> {
+    let connection = wayland_connection()?;
+    verify_capture_peer(&connection)?;
+    u32::try_from(peer_pid(connection.backend().poll_fd().as_raw_fd())?)
+        .context("invalid Hyprland compositor PID")
+}
+
+fn active_window_from_json(active: &serde_json::Value) -> Result<Option<(u64, u32)>> {
+    let object = active
+        .as_object()
+        .context("invalid Hyprland active window response")?;
+    if object.is_empty() {
+        return Ok(None);
+    }
+    let address = object
+        .get("address")
+        .and_then(|value| value.as_str())
+        .context("Hyprland active window has no address")?;
+    let pid = object
+        .get("pid")
+        .and_then(|value| value.as_u64())
+        .context("Hyprland active window has no process ID")?;
+    let address = u64::from_str_radix(address.strip_prefix("0x").unwrap_or(address), 16)
+        .context("invalid Hyprland active window address")?;
+    let pid = u32::try_from(pid)?;
+    if address == 0 || pid == 0 {
+        bail!("invalid Hyprland active window identity");
+    }
+    Ok(Some((address, pid)))
+}
+
+/// Fresh attested focus observation; empty object means no active window.
+pub fn active_window_identity() -> Result<Option<(u64, u32)>> {
+    active_window_from_json(&query::<serde_json::Value>("j/activewindow")?)
+}
+
 pub fn target_is_active(address: u64, pid: Option<u32>) -> Result<bool> {
     let target = window_for_address(address).context("Hyprland target no longer exists")?;
     if pid.is_some_and(|pid| pid != target.pid) {
         bail!("Hyprland target belongs to a different process");
     }
-    let active: serde_json::Value = query("j/activewindow")?;
-    Ok(
-        active.get("address").and_then(|v| v.as_str()) == Some(format!("0x{address:x}").as_str())
-            && active.get("pid").and_then(|v| v.as_u64()) == Some(u64::from(target.pid)),
-    )
+    Ok(active_window_identity()? == Some((address, target.pid)))
 }
 
 fn capture_target(windows: &[Window], address: u64, pid: Option<u32>) -> Result<Window> {
@@ -407,20 +979,68 @@ fn capture_target(windows: &[Window], address: u64, pid: Option<u32>) -> Result<
     Ok(target.clone())
 }
 
-pub fn capture(address: u64, pid: Option<u32>) -> Result<Vec<u8>> {
+/// Window-local export contains the root/subsurface buffer, never an
+/// off-base xdg popup. Snapshot the same scene protocol before and after
+/// copying pixels so a recycled address or same-box replacement cannot
+/// inherit screenshot authority.
+pub fn capture_with_geometry(
+    address: u64,
+    pid: Option<u32>,
+) -> Result<(Vec<u8>, Window, DesktopFrame, CapturedWindowScene)> {
+    let inventory = super::hyprland_input::frame_inventory_if_available()?;
+    let frame = desktop_frame()?;
     let before = capture_target(&list_windows()?, address, pid)?;
+    let kind = target_kind(before.pid, before.address)?;
+    let xwayland = if kind == TargetKind::XWayland && inventory.is_some() {
+        Some(super::hyprland_input::inspect_xwayland_capture(
+            before.pid,
+            before.address,
+        )?)
+    } else {
+        None
+    };
+    if let Some(snapshot) = &inventory {
+        if !snapshot.rows.iter().any(|row| {
+            row.pid == before.pid
+                && row.address == before.address
+                && !row.popup
+                && xwayland.as_ref().is_none_or(|proof| row == &proof.root)
+        }) || xwayland.as_ref().is_some_and(|proof| {
+            proof.epoch != snapshot.epoch || proof.tree_revision != snapshot.tree_revision
+        }) {
+            bail!("Hyprland root surface absent from capture scene; refresh screenshot");
+        }
+    }
     let bytes = super::hyprland_capture::capture_toplevel_png(address)?;
     let after = capture_target(&list_windows()?, address, pid)?;
-    if before != after {
-        bail!("Hyprland target changed during capture; refresh the snapshot");
+    let live_inventory = super::hyprland_input::frame_inventory_if_available()?;
+    let live_xwayland = if xwayland.is_some() {
+        Some(super::hyprland_input::inspect_xwayland_capture(
+            after.pid,
+            after.address,
+        )?)
+    } else {
+        None
+    };
+    capture_scene_unchanged(&inventory, &live_inventory, &frame, &desktop_frame()?)?;
+    if before != after
+        || kind != target_kind(after.pid, after.address)?
+        || xwayland != live_xwayland
+    {
+        bail!("Hyprland target or native/XWayland kind changed during capture; refresh screenshot");
     }
-    // Keep the established window-local logical coordinate contract. Physical
-    // toplevel buffers can use a fractional render scale; do not make callers
-    // infer it from a monitor mode or apply an output-origin offset.
-    let image = image::load_from_memory(&bytes)?;
-    if image.width() == before.width && image.height() == before.height {
-        return Ok(bytes);
+    // XWayland's separately inspected XID and root lifetime augment, rather
+    // than replace, its observed inventory root row.
+    let scene = CapturedWindowScene {
+        inventory,
+        xwayland,
+    };
+    // The export buffer belongs to this toplevel only; normalize its render
+    // scale into local logical coordinates. Never add the monitor/frame origin.
+    if cua_driver_core::image_utils::png_dimensions(&bytes)? == (before.width, before.height) {
+        return Ok((bytes, before, frame, scene));
     }
+    let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)?;
     let image = image.resize_exact(
         before.width,
         before.height,
@@ -428,7 +1048,11 @@ pub fn capture(address: u64, pid: Option<u32>) -> Result<Vec<u8>> {
     );
     let mut out = std::io::Cursor::new(Vec::new());
     image.write_to(&mut out, image::ImageFormat::Png)?;
-    Ok(out.into_inner())
+    Ok((out.into_inner(), before, frame, scene))
+}
+
+pub fn capture(address: u64, pid: Option<u32>) -> Result<Vec<u8>> {
+    Ok(capture_with_geometry(address, pid)?.0)
 }
 
 #[cfg(test)]
@@ -749,34 +1373,311 @@ mod tests {
 
     fn display_monitor() -> DisplayMonitor {
         serde_json::from_value(serde_json::json!({
+            "name": "main", "id": 1,
             "width": 1920, "height": 1080, "scale": 1.0,
             "x": 0, "y": 0, "transform": 0,
         }))
         .unwrap()
     }
 
+    fn monitor_at(
+        name: &str,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        scale: f64,
+        transform: u32,
+    ) -> DisplayMonitor {
+        let mut monitor = display_monitor();
+        monitor.name = name.into();
+        (
+            monitor.x,
+            monitor.y,
+            monitor.width,
+            monitor.height,
+            monitor.scale,
+            monitor.transform,
+        ) = (x, y, width, height, scale, transform);
+        monitor
+    }
+
     #[test]
-    fn display_identity_accepts_qualified_native_geometry() {
+    fn mixed_scale_rotation_and_negative_origin_map_only_powered_output_points() {
+        let left = monitor_at("left", -300, 0, 600, 400, 2.0, 0);
+        let right = monitor_at("right", 0, 400, 800, 1200, 1.5, 1);
+        let frame = desktop_frame_from_monitors(vec![right.clone(), left.clone()]).unwrap();
         assert_eq!(
-            screen_size_from_monitors(vec![display_monitor()]).unwrap(),
-            (1920, 1080, 1.0)
+            (frame.x, frame.y, frame.width, frame.height),
+            (-300, 0, 1100, 933)
+        );
+        assert_eq!(
+            (frame.outputs[0].width, frame.outputs[0].height),
+            (300, 200)
+        );
+        assert_eq!(
+            (frame.outputs[1].width, frame.outputs[1].height),
+            (800, 533)
+        );
+        assert_eq!(frame.to_layout(299.0, 199.0).unwrap(), (-1.0, 199.0));
+        assert_eq!(frame.to_layout(300.0, 400.0).unwrap(), (0.0, 400.0));
+        for point in [(300.0, 199.0), (299.0, 400.0), (1100.0, 500.0), (-1.0, 0.0)] {
+            assert!(frame.to_layout(point.0, point.1).is_err(), "{point:?}");
+        }
+        assert_eq!(
+            screen_size_from_monitors(vec![left, right]).unwrap(),
+            (1100, 933, 1.0)
         );
     }
 
     #[test]
-    fn display_identity_rejects_ambiguous_outputs_and_unsupported_frames() {
+    fn dpms_hotplug_and_same_dimensions_reconfig_change_frame_identity() {
+        let left = monitor_at("left", -300, 0, 600, 400, 2.0, 0);
+        let right = monitor_at("right", 0, 400, 800, 1200, 1.5, 1);
+        let original = desktop_frame_from_monitors(vec![left.clone(), right.clone()]).unwrap();
+        let mut off = left.clone();
+        off.dpms_status = false;
+        let standby = desktop_frame_from_monitors(vec![off, right.clone()]).unwrap();
+        assert_ne!(original, standby);
+        assert_eq!(
+            (standby.x, standby.y, standby.width, standby.height),
+            (0, 400, 800, 533)
+        );
+        let unplugged = desktop_frame_from_monitors(vec![right.clone()]).unwrap();
+        assert_eq!(standby, unplugged);
+        let mut changed = right.clone();
+        changed.scale = 1.0;
+        changed.width = 533;
+        changed.height = 800;
+        assert_ne!(
+            original,
+            desktop_frame_from_monitors(vec![left, changed]).unwrap()
+        );
+        let mut all_off = right;
+        all_off.dpms_status = false;
+        assert!(desktop_frame_from_monitors(vec![all_off]).is_err());
+    }
+
+    #[test]
+    fn capture_refuses_scene_change_even_when_output_geometry_is_identical() {
+        let frame = desktop_frame_from_monitors(vec![display_monitor()]).unwrap();
+        let initial = Some(super::super::hyprland_input::FrameInventory {
+            epoch: "1234567890abcdef1234567890abcdef".into(),
+            tree_revision: 40,
+            rows: vec![],
+        });
+        assert!(capture_scene_unchanged(&initial, &initial, &frame, &frame).is_ok());
+        let mut workspace_switch = initial.clone();
+        workspace_switch.as_mut().unwrap().tree_revision += 1;
+        assert!(capture_scene_unchanged(&initial, &workspace_switch, &frame, &frame).is_err());
+        assert!(capture_scene_unchanged(&initial, &None, &frame, &frame).is_err());
+        let mut moved_output = frame.clone();
+        moved_output.outputs[0].x += 1;
+        assert!(capture_scene_unchanged(&initial, &initial, &frame, &moved_output).is_err());
+    }
+
+    #[test]
+    fn virtual_pointer_extent_keeps_enabled_standby_output_but_actions_do_not() {
+        let mut left = monitor_at("left", -300, 0, 600, 400, 2.0, 0);
+        left.dpms_status = false;
+        let right = monitor_at("right", 0, 400, 800, 1200, 1.5, 1);
+        assert_eq!(
+            pointer_layout_from_monitors(vec![left.clone(), right.clone()]).unwrap(),
+            (-300, 0, 1100, 933)
+        );
+        let frame = desktop_frame_from_monitors(vec![left.clone(), right.clone()]).unwrap();
+        assert_eq!((frame.x, frame.y), (0, 400));
+        assert!(frame.to_layout(-299.0, -390.0).is_err());
+        left.disabled = true;
+        assert_eq!(
+            pointer_layout_from_monitors(vec![left, right]).unwrap(),
+            (0, 400, 800, 533)
+        );
+    }
+
+    #[test]
+    fn standby_and_disabled_workspaces_do_not_report_windows_visible() {
+        let monitors: Vec<Monitor> = serde_json::from_value(serde_json::json!([
+            {"activeWorkspace":{"id":1}, "specialWorkspace":{"id":0},
+             "dpmsStatus":true, "disabled":false},
+            {"activeWorkspace":{"id":2}, "specialWorkspace":{"id":3},
+             "dpmsStatus":false, "disabled":false},
+            {"activeWorkspace":{"id":4}, "specialWorkspace":{"id":0},
+             "dpmsStatus":true, "disabled":true}
+        ]))
+        .unwrap();
+        assert_eq!(active_workspace_ids(monitors), HashSet::from([1]));
+    }
+
+    #[test]
+    fn display_identity_refuses_invalid_layouts_without_guessing_origin() {
         assert!(screen_size_from_monitors(vec![]).is_err());
-        assert!(screen_size_from_monitors(vec![display_monitor(), display_monitor()]).is_err());
-        for scale in [0.0, 1.25, 2.0, f64::NAN, f64::INFINITY] {
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let mut monitor = display_monitor();
             monitor.scale = scale;
             assert!(screen_size_from_monitors(vec![monitor]).is_err());
         }
-        for (x, y, transform) in [(100, 0, 0), (0, -100, 0), (0, 0, 1), (0, 0, 7)] {
-            let mut monitor = display_monitor();
-            (monitor.x, monitor.y, monitor.transform) = (x, y, transform);
-            assert!(screen_size_from_monitors(vec![monitor]).is_err());
-        }
+        let monitor = display_monitor();
+        assert!(screen_size_from_monitors(vec![monitor.clone(), monitor.clone()]).is_err());
+        let mut invalid = monitor.clone();
+        invalid.transform = 8;
+        assert!(screen_size_from_monitors(vec![invalid]).is_err());
+        let mut overlapping = monitor.clone();
+        overlapping.name = "other".into();
+        overlapping.x = 100;
+        assert!(screen_size_from_monitors(vec![monitor, overlapping]).is_err());
+    }
+
+    #[test]
+    fn oriented_scaled_outputs_composite_at_logical_positions_not_physical_offsets() {
+        let left = monitor_at("left", -2, 0, 4, 2, 2.0, 0);
+        let right = monitor_at("right", 1, 2, 2, 4, 2.0, 1);
+        let frame = desktop_frame_from_monitors(vec![left, right]).unwrap();
+        assert_eq!((frame.width, frame.height), (5, 3));
+        let mut canvas =
+            image::RgbaImage::from_pixel(frame.width, frame.height, image::Rgba([0, 0, 0, 255]));
+        let png = |color| {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(2, 1, color))
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        };
+        let red = image::Rgba([255, 0, 0, 255]);
+        let blue = image::Rgba([0, 0, 255, 255]);
+        let red_png = png(red);
+        let blue_png = png(blue);
+        composite_output_png(&mut canvas, &frame, &frame.outputs[0], &red_png).unwrap();
+        composite_output_png(&mut canvas, &frame, &frame.outputs[1], &blue_png).unwrap();
+        assert_eq!(*canvas.get_pixel(0, 0), red);
+        assert_eq!(*canvas.get_pixel(1, 0), red);
+        assert_eq!(*canvas.get_pixel(3, 2), blue);
+        assert_eq!(*canvas.get_pixel(4, 2), blue);
+        assert_eq!(*canvas.get_pixel(2, 1), image::Rgba([0, 0, 0, 255]));
+        let physical_png = {
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::new(4, 2))
+                .write_to(&mut out, image::ImageFormat::Png)
+                .unwrap();
+            out.into_inner()
+        };
+        assert!(
+            composite_output_png(&mut canvas, &frame, &frame.outputs[0], &physical_png).is_err()
+        );
+    }
+
+    #[test]
+    fn exact_target_kind_requires_compositor_xwayland_metadata() {
+        let parse = |value| serde_json::from_value::<Vec<ClientKind>>(value);
+        assert!(parse(serde_json::json!([
+            {"address":"0x10","pid":42,"mapped":true}
+        ]))
+        .is_err());
+        let native = parse(serde_json::json!([
+            {"address":"0x10","pid":42,"mapped":true,"xwayland":false}
+        ]))
+        .unwrap();
+        assert_eq!(
+            target_kind_from_clients(native, 42, 0x10).unwrap(),
+            TargetKind::Native
+        );
+        let x11 = parse(serde_json::json!([
+            {"address":"0x10","pid":42,"mapped":true,"xwayland":true}
+        ]))
+        .unwrap();
+        assert_eq!(
+            target_kind_from_clients(x11, 42, 0x10).unwrap(),
+            TargetKind::XWayland
+        );
+        let wrong_pid = parse(serde_json::json!([
+            {"address":"0x10","pid":43,"mapped":true,"xwayland":false}
+        ]))
+        .unwrap();
+        assert!(target_kind_from_clients(wrong_pid, 42, 0x10)
+            .unwrap_err()
+            .downcast_ref::<TargetAbsent>()
+            .is_none());
+        let unmapped = parse(serde_json::json!([
+            {"address":"0x10","pid":42,"mapped":false,"xwayland":false}
+        ]))
+        .unwrap();
+        assert!(target_kind_from_clients(unmapped, 42, 0x10)
+            .unwrap_err()
+            .downcast_ref::<TargetAbsent>()
+            .is_some());
+        assert!(target_kind_from_clients(vec![], 42, 0x10)
+            .unwrap_err()
+            .downcast_ref::<TargetAbsent>()
+            .is_some());
+    }
+
+    #[test]
+    fn active_window_requires_exact_pid_and_address() {
+        assert_eq!(
+            active_window_from_json(&serde_json::json!({})).unwrap(),
+            None
+        );
+        assert_eq!(
+            active_window_from_json(&serde_json::json!({
+                "address":"0x2a","pid":7
+            }))
+            .unwrap(),
+            Some((42, 7))
+        );
+        assert!(active_window_from_json(&serde_json::json!({"address":"0x2a"})).is_err());
+        assert!(active_window_from_json(&serde_json::json!({"address":"0x0","pid":7})).is_err());
+    }
+
+    #[test]
+    fn layer_inventory_uses_global_coordinates_on_offset_outputs() {
+        let left = monitor_at("left", -200, 0, 400, 200, 2.0, 0);
+        let right = monitor_at("right", 100, 100, 400, 200, 2.0, 0);
+        let frame = desktop_frame_from_monitors(vec![left, right]).unwrap();
+        let reports: HashMap<String, LayerReport> = serde_json::from_value(serde_json::json!({
+            "right": {"levels": {
+                "2": [{"address":"0x10","namespace":"client-declared",
+                       "x":110,"y":110,"w":30,"h":20}],
+                "3": []
+            }}
+        }))
+        .unwrap();
+        let target = layer_at_from_reports(&frame, &reports, 115, 115)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                target.address,
+                target.x,
+                target.y,
+                target.width,
+                target.height,
+                target.level
+            ),
+            (16, 110, 110, 30, 20, 2)
+        );
+        assert_eq!(target.namespace, "client-declared");
+        assert!(layer_at_from_reports(&frame, &reports, 0, 100).is_err());
+        assert!(layer_at_from_reports(&frame, &reports, 155, 115)
+            .unwrap()
+            .is_none());
+        let negative: HashMap<String, LayerReport> = serde_json::from_value(serde_json::json!({
+            "left": {"levels": {"2": [
+                {"address":"0x30","namespace":"left-layer","x":-190,"y":10,"w":30,"h":20}
+            ]}}
+        }))
+        .unwrap();
+        let left_target = layer_at_from_reports(&frame, &negative, -185, 15)
+            .unwrap()
+            .unwrap();
+        assert_eq!((left_target.x, left_target.y), (-190, 10));
+        let ambiguous: HashMap<String, LayerReport> = serde_json::from_value(serde_json::json!({
+            "right": {"levels": {"2": [
+                {"address":"0x10","namespace":"a","x":110,"y":110,"w":30,"h":20},
+                {"address":"0x20","namespace":"b","x":112,"y":110,"w":30,"h":20}
+            ]}}
+        }))
+        .unwrap();
+        assert!(layer_at_from_reports(&frame, &ambiguous, 115, 115).is_err());
     }
 
     #[test]

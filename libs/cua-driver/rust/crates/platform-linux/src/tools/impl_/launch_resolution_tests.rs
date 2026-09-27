@@ -16,6 +16,31 @@ fn window(class: &str) -> crate::x11::WindowInfo {
 }
 
 #[test]
+fn launch_focus_reports_actual_target_activation_and_unknown_observation() {
+    let target = window("foot");
+    let previous = Ok(Some((12, 8)));
+    let activated = launch_focus_report(&previous, &Ok(Some((target.xid, 7))), &[target.clone()]);
+    assert_eq!(activated["active"], true);
+    assert_eq!(activated["focus_changed_at_samples"], true);
+    assert_eq!(activated["transient_focus_changes"], "not_monitored");
+
+    let same_process_other_window =
+        launch_focus_report(&previous, &Ok(Some((target.xid + 1, 7))), &[target.clone()]);
+    assert_eq!(same_process_other_window["active"], false);
+
+    let after_failure = launch_focus_report(
+        &previous,
+        &Err("compositor observation unavailable".into()),
+        &[target],
+    );
+    assert_eq!(after_failure["active"], serde_json::Value::Null);
+    assert_eq!(
+        after_failure["focus_observation_error"],
+        "compositor observation unavailable"
+    );
+}
+
+#[test]
 fn launch_queries_match_window_classes() {
     assert!(window_matches_launch(
         &window("org.gnome.Nautilus"),

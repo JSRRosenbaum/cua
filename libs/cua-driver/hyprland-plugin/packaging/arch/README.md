@@ -1,57 +1,46 @@
-# Arch local-development package
+# Omarchy paired native candidate package
 
-This recipe builds the optional plugin directly from a Cua monorepo checkout.
-It is intentionally unsuitable for an AUR or binary repository: there is no
-remote source archive, checksum substitution, or promise of ABI compatibility
-with another machine.
+`PKGBUILD` is a template for the local Driver 0.29.1 / Hyprland 0.56.2 fork
+candidate, not a checkout-driven `makepkg -si` recipe. Do not build it against
+the loaded desktop or load/unload the live plugin. Its module must be activated
+only in a fresh disposable compositor first, and in a fresh production login
+only after separate approval.
 
-Install the exact Hyprland package and development files used by the running
-Omarchy/Arch session. Point `CUA_SOURCE_ROOT` at the monorepo root and pass the
-full package version reported by pacman; the package release suffix is part of
-the pin and must not be guessed:
+Prepare the immutable `compositor`, `driver`, and `plugin` kits with
+`downstream/omarchy/candidate_profile.py prepare --repo REPO --compositor FORK
+--stage STAGED_DESTDIR --output NEW_KIT_DIRECTORY`. Run preparation while the
+host still has the exact reviewed stock Hyprland/Driver/plugin profile.
+Source provenance records each source file digest and the final Cua revision;
+the compositor profile records staged file inventory, header tree, ABI hash,
+binary hash and fork revision. The paired profiles bind the actual compiler,
+Rust toolchain, native runtime and package versions. Retain the independent
+SHA-256 of the plugin kit's `KIT-PROVENANCE.json` for consumer checks.
 
-```bash
-export CUA_SOURCE_ROOT=/path/to/cua
-export CUA_HYPRLAND_PACKAGE_VERSION="$(pacman -Q hyprland | cut -d' ' -f2-)"
-export CUA_HYPRLAND_HEADER_VERSION=0.56.2
-makepkg -si
-```
+Build only as an ordinary user in a disposable, dependency-complete Arch root
+with the profile's exact packages and matching compiler/Rust toolchain. Bind
+the staged compositor read-only at the *same absolute path* used during
+preparation, and set a private `XDG_RUNTIME_DIR` before invoking `makepkg`.
+The staged fork supplies the plugin's reviewed `hyprland.pc`; `pkgconf` must
+select those exact headers. In that isolated root:
 
-The recipe requires that exact installed package version and the exact
-pkg-config header version, records the package dependency, builds from
-`$CUA_SOURCE_ROOT/libs/cua-driver/hyprland-plugin`, runs the configured CTest
-suite during `check()`, and installs only:
+1. Build `compositor/` using `makepkg --noconfirm`. Its package reproduces the
+   verified stage, with its own fork package/version; it does not claim the
+   stock `hyprland=0.56.2-3` package identity.
+2. Remove stock Hyprland through a normal ALPM transaction, then install that
+   exact locally built compositor package in the disposable root. Never use
+   `--nodeps` or resolve a package conflict by installing into the live host.
+3. Build `driver/` and `plugin/` using `makepkg --noconfirm`. The latter
+   requires the exact installed candidate compositor, checks the configured
+   native CTest suite, and declares its direct `libeis.so.1` provider (`libei`)
+   in addition to its exact native ABI dependencies.
+4. Inspect the resulting package payloads and paired build provenance before
+   assembling an isolated candidate root. `disposable_namespace.sh` checks
+   those paired binaries, module and metadata and privately binds them over
+   the stock filesystem; it does not modify the host `/usr`.
 
-```text
-/usr/lib/cua/hyprland/cua-hyprland-plugin.so
-/usr/share/licenses/cua-hyprland-plugin-local/LICENSE
-```
-
-It does not edit Hyprland configuration or load the plugin. Load, check, and
-unload it explicitly:
-
-```bash
-hyprctl plugin load /usr/lib/cua/hyprland/cua-hyprland-plugin.so
-hyprctl -j cua:status
-hyprctl plugin unload /usr/lib/cua/hyprland/cua-hyprland-plugin.so
-```
-
-After every Hyprland upgrade, remove or rebuild this local package before
-loading it again. An exact dependency conflict is intentional protection
-against carrying a stale compositor ABI module forward.
-
-This is deliberately a monorepo-local development recipe, not an AUR or clean
-chroot source package. Fleet must make the recorded candidate source available
-at `CUA_SOURCE_ROOT` and record its Git SHA. Build with the same compiler family
-and version used for Hyprland; matching the package, headers, full Hyprland ABI
-fingerprint, and C++26 language mode does not make different C++ toolchains
-interchangeable.
-
-Fleet images should consume this same monorepo recipe or a derived reviewed
-recipe, pin the image's exact Hyprland package, and keep the plugin unloaded by
-default. The initial acceptance image must match Omarchy `4.0.2-1`, Hyprland
-`0.56.2`, xdg-desktop-portal-hyprland `1.4.1`, Cua Driver `0.23.2`, and a
-UWSM/SDDM session. This packages a discovery-only plugin; isolated background
-input is not available in stable `0.23.2` or nightly. See
-`../../tests/README.md` for the required Fleet and subsequent bare-metal
-promotion evidence.
+`downstream/omarchy/rollback.py snapshot` retains the signed known-good
+package archives and metadata, while `rollback.py check` verifies them
+offline. Neither performs a host package transaction or an automatic rollback.
+No package recipe, kit preparation, or namespace launch activates the live
+plugin. Candidate native acceptance and any eventual production promotion
+remain separate evidence/authorization steps.

@@ -114,3 +114,17 @@ fn refuses_ambiguous_substring_and_unknown_names() {
     assert!(match_installed_app(&apps, "gnome-calculator").is_none());
     assert!(match_installed_app(&apps, "").is_none());
 }
+
+#[test]
+fn owned_launch_never_resolves_a_host_command_or_url() {
+    for input in ["foot", "xdg-open https://example.invalid", "", "../foot"] {
+        assert!(owned_launch_command(input, &[]).is_err(), "{input:?}");
+    }
+    let (program, args) = owned_launch_command(
+        "/tmp/app with spaces",
+        &["--title".into(), "isolated".into()],
+    )
+    .unwrap();
+    assert_eq!(program, "/tmp/app with spaces");
+    assert_eq!(args, ["--title", "isolated"]);
+}

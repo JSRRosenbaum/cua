@@ -40,13 +40,6 @@ cua_hyprland_harden(cua_hyprland_protocol)
 set_target_properties(cua_hyprland_protocol PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(BUILD_TESTING)
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    add_test(NAME cua_hyprland_desktop_fault_policy_test
-        COMMAND ${Python3_EXECUTABLE} -B
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/desktop_fault_policy_test.py)
-    set_tests_properties(cua_hyprland_desktop_fault_policy_test PROPERTIES
-        ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}")
-
     add_executable(cua_hyprland_foreground_route_test tests/foreground_route_test.cpp)
     target_compile_features(cua_hyprland_foreground_route_test PRIVATE cxx_std_26)
     target_include_directories(cua_hyprland_foreground_route_test PRIVATE src)
@@ -76,6 +69,12 @@ if(BUILD_TESTING)
     target_include_directories(cua_hyprland_drag_geometry_test PRIVATE src)
     target_compile_options(cua_hyprland_drag_geometry_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME cua_hyprland_drag_geometry_test COMMAND cua_hyprland_drag_geometry_test)
+    add_executable(cua_hyprland_seat_selection_payload_test tests/seat_selection_payload_test.cpp)
+    target_compile_features(cua_hyprland_seat_selection_payload_test PRIVATE cxx_std_26)
+    target_include_directories(cua_hyprland_seat_selection_payload_test PRIVATE src)
+    target_compile_options(cua_hyprland_seat_selection_payload_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME cua_hyprland_seat_selection_payload_test COMMAND cua_hyprland_seat_selection_payload_test)
+
 
     add_test(NAME cua_hyprland_cmake_api_test
         COMMAND ${CMAKE_COMMAND}
@@ -217,7 +216,10 @@ if(CUA_HYPRLAND_BUILD_PLUGIN)
         if(NOT HYPRLAND_VERSION STREQUAL "0.56.2")
             message(FATAL_ERROR "Input is pinned to Hyprland 0.56.2")
         endif()
-        target_sources(cua_hyprland_plugin PRIVATE src/input_experiment.cpp)
+        target_sources(cua_hyprland_plugin PRIVATE src/input_experiment.cpp src/seat_selection.cpp)
+        # InputCapture.hpp exposes Eis.hpp, which needs libeis's non-default include path.
+        pkg_check_modules(LIBEIS REQUIRED IMPORTED_TARGET libeis-1.0)
+        target_link_libraries(cua_hyprland_plugin PRIVATE PkgConfig::LIBEIS)
     endif()
     if(CUA_HYPRLAND_INPUT)
         target_compile_definitions(cua_hyprland_plugin PRIVATE CUA_HYPRLAND_INPUT=1)

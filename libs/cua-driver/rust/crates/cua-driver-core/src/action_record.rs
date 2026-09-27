@@ -92,6 +92,8 @@ pub enum ActionTransport {
     LinuxCuaCompositorInject,
     LinuxHyprlandIsolatedInput,
     LinuxHyprlandForegroundInput,
+    LinuxHyprlandAgentSelection,
+    LinuxHyprlandDataTransfer,
     LinuxX11ConfigureWindow,
     BrowserCdpInputMouse,
     BrowserCdpInputKey,
@@ -131,6 +133,8 @@ impl ActionTransport {
         Self::LinuxCuaCompositorInject,
         Self::LinuxHyprlandIsolatedInput,
         Self::LinuxHyprlandForegroundInput,
+        Self::LinuxHyprlandAgentSelection,
+        Self::LinuxHyprlandDataTransfer,
         Self::LinuxX11ConfigureWindow,
         Self::BrowserCdpInputMouse,
         Self::BrowserCdpInputKey,
@@ -170,6 +174,9 @@ impl ActionTransport {
             | Self::LinuxHyprlandForegroundInput
             | Self::LinuxCuaCompositorInject => ActionRoute::GlobalInput,
             Self::WindowsSetWindowPos | Self::LinuxX11ConfigureWindow => ActionRoute::SystemApi,
+            Self::LinuxHyprlandAgentSelection | Self::LinuxHyprlandDataTransfer => {
+                ActionRoute::DataTransfer
+            }
             Self::BrowserCdpRuntimeFunction => ActionRoute::Dom,
             Self::BrowserCdpInputMouse | Self::BrowserCdpInputKey => ActionRoute::TrustedInput,
         }
@@ -185,6 +192,7 @@ pub enum ActionRoute {
     SystemApi,
     Dom,
     TrustedInput,
+    DataTransfer,
 }
 
 /// Evidence supporting an action effect, intentionally without request data.
@@ -353,6 +361,7 @@ impl ActionExecutionRecord {
                 ActionRoute::SystemApi => cua_driver_contract::ActionRoute::SystemApi,
                 ActionRoute::Dom => cua_driver_contract::ActionRoute::Dom,
                 ActionRoute::TrustedInput => cua_driver_contract::ActionRoute::TrustedInput,
+                ActionRoute::DataTransfer => cua_driver_contract::ActionRoute::DataTransfer,
             },
             delivery: projection
                 .delivery
@@ -1044,6 +1053,7 @@ fn route_name(route: ActionRoute) -> &'static str {
         ActionRoute::SystemApi => "system_api",
         ActionRoute::Dom => "dom",
         ActionRoute::TrustedInput => "trusted_input",
+        ActionRoute::DataTransfer => "data_transfer",
     }
 }
 
@@ -1124,6 +1134,8 @@ fn transport_name(transport: ActionTransport) -> &'static str {
         ActionTransport::LinuxCuaCompositorInject => "linux_cua_compositor_inject",
         ActionTransport::LinuxHyprlandIsolatedInput => "linux_hyprland_isolated_input",
         ActionTransport::LinuxHyprlandForegroundInput => "linux_hyprland_foreground_input",
+        ActionTransport::LinuxHyprlandAgentSelection => "linux_hyprland_agent_selection",
+        ActionTransport::LinuxHyprlandDataTransfer => "linux_hyprland_data_transfer",
         ActionTransport::LinuxX11ConfigureWindow => "linux_x11_configure_window",
         ActionTransport::BrowserCdpInputMouse => "browser_cdp_input_mouse",
         ActionTransport::BrowserCdpInputKey => "browser_cdp_input_key",

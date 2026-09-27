@@ -283,6 +283,36 @@ impl SdkAdapter {
         self.mark_all_sessions_ended();
         count
     }
+    /// Local operator revocation is not an agent's `end_session` tool call.
+    /// Resolve the public label inside this runtime, refuse ambiguity, then
+    /// end that exact private lifecycle ID regardless of which MCP transport
+    /// owns it. No other runtime or same-label agent connection is touched.
+    pub async fn revoke_public_session(&self, label: &str) -> Result<(), String> {
+        let _lifecycle = self.session_lifecycle.lock().await;
+        let mut matching = cua_driver_core::session::list_session_snapshots_with_prefix(
+            &self.runtime_prefix,
+            cua_driver_core::session::DEFAULT_SESSION_IDLE_TTL,
+        )
+        .into_iter()
+        .filter(|session| {
+            !session.ending
+                && !session.implicit
+                && session
+                    .public_label
+                    .as_deref()
+                    .and_then(cursor_overlay::sanitize_session_label)
+                    .as_deref()
+                    == Some(label)
+        });
+        let target = matching
+            .next()
+            .ok_or_else(|| "No active named session matches that label".to_owned())?;
+        if matching.next().is_some() {
+            return Err("Multiple active owners share that label; revoke-one is ambiguous".into());
+        }
+        cua_driver_core::session::end_session(&target.runtime_id);
+        Ok(())
+    }
 
     pub fn begin_tool_call(
         &self,
@@ -669,5 +699,53 @@ mod tests {
             sdk.public_session_observation_state(session).ended,
             "a failed in-band end must not erase an out-of-band tombstone"
         );
+    }
+
+    #[tokio::test]
+    async fn operator_revokes_exact_foreign_transport_and_refuses_ambiguous_labels() {
+        use cua_driver_core::session::{self, SessionClientKind, SessionTransport};
+        let _runtime_guard = crate::test_runtime_lock().lock().await;
+        let sdk = SdkAdapter::load(host_driver()).await.expect("SDK adapter");
+        let other = SdkAdapter::load(host_driver())
+            .await
+            .expect("other SDK adapter");
+        let label = "operator-target";
+        let first_id = format!("{}mcp-one", sdk.runtime_prefix);
+        let second_id = format!("{}mcp-two", sdk.runtime_prefix);
+        let other_id = format!("{}mcp-one", other.runtime_prefix);
+        let first_owner = format!("{}transport-one", sdk.runtime_prefix);
+        let second_owner = format!("{}transport-two", sdk.runtime_prefix);
+        let other_owner = format!("{}transport-one", other.runtime_prefix);
+        for (id, owner) in [
+            (&first_id, &first_owner),
+            (&second_id, &second_owner),
+            (&other_id, &other_owner),
+        ] {
+            session::activate_or_revive_session_for_owner(
+                id,
+                Some(label),
+                owner,
+                false,
+                SessionTransport::McpStdio,
+                SessionClientKind::Mcp,
+                None,
+            )
+            .unwrap();
+        }
+
+        assert!(sdk
+            .revoke_public_session(label)
+            .await
+            .unwrap_err()
+            .contains("ambiguous"));
+        assert!(!session::is_session_ended(&first_id));
+        assert!(!session::is_session_ended(&second_id));
+        session::end_session(&second_id);
+        sdk.revoke_public_session(label).await.unwrap();
+        assert!(session::is_session_ended(&first_id));
+        assert!(!session::is_session_ended(&other_id));
+        assert!(sdk.revoke_public_session(label).await.is_err());
+        other.shutdown().await.expect("other shutdown");
+        sdk.shutdown().await.expect("shutdown");
     }
 }

@@ -14,6 +14,12 @@ pub mod ext_toplevel;
 pub mod hyprland;
 pub mod hyprland_capture;
 mod hyprland_compatibility;
+
+/// Selected native input compatibility gate. This never grants action
+/// authorization, overrides XWayland routing, or certifies an untested client.
+pub fn native_compatibility_mode() -> &'static str {
+    hyprland_compatibility::compatibility_mode().as_str()
+}
 pub mod hyprland_input;
 pub mod kwin_helper;
 pub mod overlay;
@@ -1139,6 +1145,12 @@ fn crop_png_to_rect(
 /// 5. X11: existing root-window path.
 pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
     if is_wayland() {
+        if hyprland::is_session() {
+            // The compositor's powered-output frame is captured with one
+            // attested geometry snapshot; a single wl_output screenshot is
+            // not the whole desktop on a multioutput layout.
+            return hyprland::capture_desktop_frame_png();
+        }
         // Tier 1: the opt-in GNOME compositor helper. It avoids probing
         // wlroots-only protocols and captures the Shell stage without consent.
         // If the helper is present but capture fails, do not fall through to
@@ -1254,16 +1266,16 @@ pub struct VptrSession {
     state: State,
     pub seat: WlSeat,
     pub vptr: ZwlrVirtualPointerV1,
+    pub output_origin_x: i32,
+    pub output_origin_y: i32,
     pub output_w: u32,
     pub output_h: u32,
 }
 
-/// Bind manager + seat + virtual-pointer + first output, optionally activate a
-/// foreign-toplevel by `window_id` so the synthesised events land on it, and
-/// return the live session that scroll / drag / click reuse. Wayland forbids a
-/// client from knowing another window's on-screen geometry, so we drive every
-/// pointer event in *output* coordinates and rely on the activated toplevel
-/// covering the centre.
+/// Bind manager + seat + virtual-pointer and the complete enabled output
+/// layout. Coordinates passed to pointer operations are compositor-global
+/// logical coordinates; motion_absolute uses the enclosing layout's origin
+/// and extent rather than clamping to the first output.
 pub fn open_vptr_session(activate_window_id: Option<u64>) -> anyhow::Result<VptrSession> {
     let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue::<State>();
@@ -1324,16 +1336,39 @@ pub fn open_vptr_session(activate_window_id: Option<u64>) -> anyhow::Result<Vptr
     }
 
     let vptr = mgr.create_virtual_pointer(Some(&seat), &qh, ());
-    let (output_w, output_h) = (state.output_w.max(1), state.output_h.max(1));
+    let (output_origin_x, output_origin_y, output_w, output_h) = if hyprland::is_session() {
+        hyprland::pointer_layout()?
+    } else {
+        (0, 0, state.output_w.max(1), state.output_h.max(1))
+    };
     Ok(VptrSession {
         conn,
         queue,
         state,
         seat,
         vptr,
+        output_origin_x,
+        output_origin_y,
         output_w,
         output_h,
     })
+}
+
+fn vptr_point(sess: &VptrSession, x: i32, y: i32) -> anyhow::Result<(u32, u32)> {
+    let px = i64::from(x) - i64::from(sess.output_origin_x);
+    let py = i64::from(y) - i64::from(sess.output_origin_y);
+    anyhow::ensure!(
+        px >= 0 && py >= 0 && px < i64::from(sess.output_w) && py < i64::from(sess.output_h),
+        "pointer point ({x},{y}) lies outside the enabled output layout"
+    );
+    if hyprland::is_session() {
+        let frame = hyprland::desktop_frame()?;
+        frame.to_layout(
+            f64::from(x) - f64::from(frame.x),
+            f64::from(y) - f64::from(frame.y),
+        )?;
+    }
+    Ok((px as u32, py as u32))
 }
 
 /// Focus and raise a specific native Wayland toplevel before focus-bound
@@ -1578,13 +1613,17 @@ fn click_vptr(
     let mut sess = open_vptr_session(window_id)?;
     std::thread::sleep(std::time::Duration::from_millis(40));
     let (w, h) = (sess.output_w, sess.output_h);
-    let (px, py) = if x == 0 && y == 0 {
-        ((w / 2) as i32, (h / 2) as i32)
+    let (target_x, target_y) = if window_id.is_some() && x == 0 && y == 0 {
+        (
+            i64::from(sess.output_origin_x) + i64::from(w / 2),
+            i64::from(sess.output_origin_y) + i64::from(h / 2),
+        )
     } else {
-        (x, y)
+        (i64::from(x), i64::from(y))
     };
-    let px = px.clamp(0, w as i32 - 1) as u32;
-    let py = py.clamp(0, h as i32 - 1) as u32;
+    let target_x = i32::try_from(target_x)?;
+    let target_y = i32::try_from(target_y)?;
+    let (px, py) = vptr_point(&sess, target_x, target_y)?;
     let btn = evdev_pointer_button(button);
     for i in 0..count.max(1) {
         if i > 0 {
@@ -1605,7 +1644,7 @@ fn click_vptr(
     }
     // Keep the synthetic-cursor registry in sync with the warp we just
     // performed so a subsequent `get_cursor_position` reflects reality.
-    record_synth_cursor(px as i32, py as i32);
+    record_synth_cursor(target_x, target_y);
     sess.vptr.destroy();
     sess.queue.roundtrip(&mut sess.state)?;
     Ok(())
@@ -1746,13 +1785,12 @@ fn scroll_vptr(
 ) -> anyhow::Result<()> {
     let mut sess = open_vptr_session(window_id)?;
     if let Some((x, y)) = point {
-        let px = x.clamp(0, (sess.output_w as i32).saturating_sub(1)) as u32;
-        let py = y.clamp(0, (sess.output_h as i32).saturating_sub(1)) as u32;
+        let (px, py) = vptr_point(&sess, x, y)?;
         sess.vptr
             .motion_absolute(event_time_ms(), px, py, sess.output_w, sess.output_h);
         sess.vptr.frame();
         sess.queue.roundtrip(&mut sess.state)?;
-        record_synth_cursor(px as i32, py as i32);
+        record_synth_cursor(x, y);
         std::thread::sleep(std::time::Duration::from_millis(15));
     }
     let (axis, sign): (Axis, i32) = match direction.to_ascii_lowercase().as_str() {
@@ -1808,11 +1846,9 @@ pub fn last_synth_cursor_pos() -> Option<(i32, i32)> {
         .and_then(|g| *g)
 }
 
-/// Warp the cursor to absolute output coordinates `(x, y)` using
-/// `zwlr_virtual_pointer_v1::motion_absolute`. Clamps to the output bounds
-/// reported by `open_vptr_session`. Emits a motion + frame and roundtrips so
-/// the compositor commits the warp before returning. Records the position in
-/// the synthetic-cursor registry so `last_synth_cursor_pos` can report it.
+/// Warp the cursor to compositor-global logical `(x, y)` using
+/// `zwlr_virtual_pointer_v1::motion_absolute`. Points outside powered outputs
+/// are refused rather than silently clamped to another output.
 pub fn move_cursor_absolute(window_id: Option<u64>, x: i32, y: i32) -> anyhow::Result<()> {
     with_libei_fallback(
         || move_cursor_absolute_vptr(window_id, x, y),
@@ -1824,12 +1860,11 @@ pub fn move_cursor_absolute(window_id: Option<u64>, x: i32, y: i32) -> anyhow::R
 fn move_cursor_absolute_vptr(window_id: Option<u64>, x: i32, y: i32) -> anyhow::Result<()> {
     let mut sess = open_vptr_session(window_id)?;
     let (w, h) = (sess.output_w, sess.output_h);
-    let px = x.clamp(0, (w as i32).saturating_sub(1)) as u32;
-    let py = y.clamp(0, (h as i32).saturating_sub(1)) as u32;
+    let (px, py) = vptr_point(&sess, x, y)?;
     sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
-    record_synth_cursor(px as i32, py as i32);
+    record_synth_cursor(x, y);
     sess.vptr.destroy();
     sess.queue.roundtrip(&mut sess.state)?;
     Ok(())
@@ -1894,13 +1929,22 @@ fn drag_vptr(
     std::thread::sleep(std::time::Duration::from_millis(40));
     let (w, h) = (sess.output_w, sess.output_h);
     let btn = evdev_pointer_button(button);
-    let clamp_xy = |x: i32, y: i32| -> (u32, u32) {
+    let (fx, fy) = vptr_point(&sess, from_x, from_y)?;
+    let (tx, ty) = vptr_point(&sess, to_x, to_y)?;
+    let n = steps.max(1);
+    // Validate every motion before pressing. A gap/DPMS transition must not
+    // strand a held button or silently steer the drag onto another output.
+    let point_at = |s: u32| {
+        let t = f64::from(s) / f64::from(n);
         (
-            x.clamp(0, w as i32 - 1) as u32,
-            y.clamp(0, h as i32 - 1) as u32,
+            (f64::from(from_x) + (f64::from(to_x) - f64::from(from_x)) * t).round() as i32,
+            (f64::from(from_y) + (f64::from(to_y) - f64::from(from_y)) * t).round() as i32,
         )
     };
-    let (fx, fy) = clamp_xy(from_x, from_y);
+    for s in 1..=n {
+        let (x, y) = point_at(s);
+        vptr_point(&sess, x, y)?;
+    }
     sess.vptr.motion_absolute(event_time_ms(), fx, fy, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
@@ -1908,27 +1952,21 @@ fn drag_vptr(
     sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
-    let n = steps.max(1);
     for s in 1..=n {
-        let t = s as f64 / n as f64;
-        let ix = (from_x as f64 + (to_x - from_x) as f64 * t).round() as i32;
-        let iy = (from_y as f64 + (to_y - from_y) as f64 * t).round() as i32;
-        let (cx, cy) = clamp_xy(ix, iy);
+        let (x, y) = point_at(s);
+        let (cx, cy) = vptr_point(&sess, x, y)?;
         sess.vptr.motion_absolute(event_time_ms(), cx, cy, w, h);
         sess.vptr.frame();
         sess.queue.roundtrip(&mut sess.state)?;
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
-    let (tx, ty) = clamp_xy(to_x, to_y);
     sess.vptr.motion_absolute(event_time_ms(), tx, ty, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
     sess.vptr
         .button(event_time_ms(), btn, ButtonState::Released);
     sess.vptr.frame();
-    // Sync the synthetic-cursor registry with the drag endpoint so a
-    // subsequent `get_cursor_position` reports where we left the pointer.
-    record_synth_cursor(tx as i32, ty as i32);
+    record_synth_cursor(to_x, to_y);
     sess.queue.roundtrip(&mut sess.state)?;
     sess.vptr.destroy();
     sess.queue.roundtrip(&mut sess.state)?;

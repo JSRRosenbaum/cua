@@ -1,0 +1,158 @@
+{
+  "schema": "cua-omarchy-native-acceptance/v1",
+  "authority": "Preparation only; every row remains unrun until the disposable exact-candidate runtime is authorized. The canonical Linux Rust E2E run and native Hyprland gates are separate required evidence.",
+  "common_prerequisites": [
+    "Private endpoint.env, exact candidate Driver/plugin/compositor SHA and build/profile hashes recorded before first action; never use the physical Cua service or user HOME",
+    "CUA_DRIVER_RS_ENABLE_WAYLAND=1, CUA_HYPRLAND_COMPATIBILITY_MODE=general-native, explicitly standard permission mode plus reviewed target-scoped authority; never unrestricted/bypass merely to broaden eligibility",
+    "Fresh per-row before/after get_window_state/get_desktop_state and compositor -j clients/activewindow/cursorpos/monitors, actual app-owned output, full MCP result including route/effect/verified/refusal",
+    "testkit ForegroundSentinel + independent compositor cursor/focus samples throughout every background action; guard input/focus canaries and a warp-and-return negative control before acceptance",
+    "Before mapping sentinel, add disposable candidate-child Lua only: hl.window_rule({ name = 'cua-canonical-sentinel-animation', match = {title = '^CuaTestHarness Sentinel \\\\[cdp=[0-9]+\\\\]$'}, no_anim = true }); reload only private child and independently query exact sentinel no_anim=true with hyprctl getprop; no edits to physical Hyprland config",
+    "Private case directory under downstream/omarchy/build, disposable app profiles and documents only; save journals, monitor layouts, screenshots, video/trajectory and versions there"
+  ],
+  "rows": [
+    {
+      "id": "general-native-gtk3",
+      "app": "GTK3 native_capabilities.py --actor Target with fresh --journal; separate Sibling process",
+      "route": "background native PX, explicit general-native",
+      "action": "Click native-activate captured coordinates while testkit sentinel owns primary focus; also exercise precise scroll, hover, modifier-click and a bounded multi-segment drag on the raw-event isolated-input fixture",
+      "oracle": "Exactly one activated journal record on Target, no sibling key/button/scroll record; raw-event journal supplies motion/press/release/scroll/modifier lifecycle for gestures; inspect action_effect/partial and no replay",
+      "negative": "Default certified mode refuses unqualified GTK3 without changing either journal; third owner/lane refusal does not silently escalate"
+    },
+    {
+      "id": "unicode-exact-gtk",
+      "app": "GTK3 native_capabilities.py Target and Sibling in separate private processes; GTK4 fixture for alternative toolkit",
+      "route": "background semantic AT-SPI exact element_token; separately seat-scoped text-input when client binds it",
+      "action": "Insert Grüße — 漢字 — مرحبا — 👩🏽‍💻 into named GTK Entry; preedit/compose route only when compositor+client advertise it",
+      "oracle": "Exact UTF-8 equality in app-owned Target text journal; Sibling text journal unchanged; distinguish delivery acknowledgement from verified application state and record language/input-method availability",
+      "negative": "Stale or mismatched token and missing target text capability refuse without fallback physical ASCII keys, clipboard mutation, or sibling input"
+    },
+    {
+      "id": "popup-child-geometry",
+      "app": "GTK3 native_capabilities.py Target; GTK3 harness context menu/popover; GTK4 fixture; Electron/Tauri shared child-window rows",
+      "route": "background native popup/subsurface tree",
+      "action": "Open native-popup-anchor, capture popup marker and child frame including off-base geometry, click visible child with its capture identity, dismiss via outside action and repeat after new popup serial",
+      "oracle": "App-owned popup-opened then popup-activated once; matching compositor popup parent and fresh tree revision; no hidden click into uncaptured area or wrong transient; child/modal remains associated with actual parent",
+      "negative": "Previously captured popup point/token after dismiss/remap refuses without clicking base or a replacement popup"
+    },
+    {
+      "id": "mixed-output",
+      "app": "Disposable candidate only: baseline lab-left -1280,0 / 1280x800 scale1 transform0, lab-main 960,240 / 1920x1080 scale2 transform1 with 0..959 logical gap; second measured candidate-only lab-left scale1.25 profile; never physical outputs",
+      "route": "native desktop frame and window-local target mapping",
+      "action": "Capture both outputs in measured baseline, click one uniquely journaled control on each and refuse the gap, crop/downsample and act from retained frame; repeat dedicated fractional profile and return to baseline; DPMS off/on lab-main then restore its transform0 only in private child",
+      "oracle": "Compositor monitor JSON + frame metadata, unique per-output app journal and before/after cursor/focus samples; frame pixels map to actual logical region and popup local surface",
+      "negative": "Old frame after private-output scale/rotation/DPMS/hotplug revision refuses; no wrong-window action and no waking sleeping output"
+    },
+    {
+      "id": "native-dnd-and-selection",
+      "app": "Two independent GTK3 native_capabilities.py Source/Destination processes, each fresh journal; separate client ownership and no personal clipboard",
+      "route": "authorized source/destination transfer_data over native seat data-device; explicit selection ownership separately",
+      "action": "Drag source widget to destination widget with MIME text/plain and explicit source/destination scope; compare with pointer-only drag, then revoke owner and probe old offer",
+      "oracle": "Source offer-sent and Destination drop-received with exact Unicode text and accepted=true; destination app state, not just delivery/endpoint motion; inspect offered MIME, compositor/data-device owner, selection ownership and explicit clipboard before/after",
+      "negative": "Mismatched destination, stale source, unsupported MIME and revoked selection refuse without delivery; physical clipboard unchanged unless explicit authorized ownership operation"
+    },
+    {
+      "id": "agent-seat-selection-real-paste",
+      "app": "Actual `agent-v3` Wayland client binds wl_data_device to named Cua-Agent wl_seat; a distinct `keyboard-sibling` client and independent private primary clipboard sentinel",
+      "route": "set_agent_selection exact session/pid/window_id with Unicode text/plain;charset=utf-8, never GTK default-seat clipboard",
+      "action": "After set returns, target receives original compositor wl_data_offer over named agent seat, reads offered FD to EOF, then Ctrl+V on same exact app target updates its app-owned editor journal; clear owner, focus another target, let TTL expire and terminate owner Driver while app stays alive",
+      "oracle": "Agent client journal records MIME offer, post-return selection-received and paste with byte-exact Unicode; primary wl-paste status/bytes unchanged; cleared/focus-changed/expired/owner-EOF offer cannot paste or deliver to sibling, and no physical focus/cursor change",
+      "negative": "A set acknowledgement, DnD result or GTK default-seat paste cannot prove agent-seat offer lifetime; old offer cannot transfer after clear/expiry, and no human clipboard may be written"
+    },
+    {
+      "id": "foot-existing-and-owned",
+      "app": "Native Foot processes using unique title and private shell input/output files under case directory; never attach user's running Foot without explicit authority",
+      "route": "general-native background on a deliberately launched client; owned new-session alternative labeled separately",
+      "action": "Type a unique Unicode token into controlled shell/editor, modifier-select, scroll and save output; verify live existing window identity is not replaced",
+      "oracle": "Shell-owned saved bytes and exact target PID/address; other Foot window remains unchanged; sentinel remains foreground for background row",
+      "negative": "Same-client/primary conflict or unsupported terminal text route must declare refusal/foreground requirement, not claim verified delivery"
+    },
+    {
+      "id": "chromium-firefox-native",
+      "app": "Installed native Chromium and Firefox with fresh private --user-data-dir / --profile and no-remote, serving repository shared-web fixture with BrowserFixtureServer/FixtureJournal; never attach logged-in profiles",
+      "route": "general-native raw only where qualified; semantic/browser exact binding is distinct from chrome/native-dialog route",
+      "action": "Browser page text/canvas, tab selection, popup/file-dialog and one app-owned save under case directory; test independently for each browser",
+      "oracle": "BrowserFixtureServer state journal or private saved file plus exact compositor client/PID identity, fresh before/after screenshot, sentinel isolation for background action",
+      "negative": "CDP page success does not prove browser chrome, native picker, shared-client isolation or physically hidden input"
+    },
+    {
+      "id": "telegram-qt-native",
+      "app": "Installed Telegram/Qt using private HOME/XDG profile; no personal logged-in account, chats or messages",
+      "route": "general-native only for available unauthenticated UI; explicit foreground or owned session for unavailable target semantics",
+      "action": "Exercise setup/login-screen controls and popup/modal identity with private profile; authenticated messaging row requires separately approved sacrificial account and is not inferred from setup UI",
+      "oracle": "Private profile/UI state or fixture-owned output, no changes in personal Telegram process/profile; client identity and continuous primary-seat observation",
+      "negative": "Missing authorized account is a prerequisite, not a passing message-send result"
+    },
+    {
+      "id": "libreoffice-current",
+      "app": "Installed LibreOffice 26.8.0-2 with fresh -env:UserInstallation=file://CASE/profile and newly created CASE/document.odt; no personal open document",
+      "route": "general-native background versus foreground labeled separately",
+      "action": "Edit unique Unicode text, open native dialog, save disposable document; repeat on existing in-case window",
+      "oracle": "Reopen case-owned ODT and check document content.xml exact text, as well as compositor PID/window and primary sentinel; do not accept older-version certification",
+      "negative": "Saving another user's open LO window or substituting qualified old package is forbidden"
+    },
+    {
+      "id": "electron-tauri-canvas",
+      "app": "Repository staged Electron/Tauri shared-web fixtures and visual-only-canvas fixture with temporary user-data directory",
+      "route": "existing cross_platform_behavior_test.rs 40-cell catalogs plus native candidate mode for unqualified windows",
+      "action": "Click, double-click, type, hotkey, scroll, hover, child window, drag and canvas coordinate target; compare AX/page/PX address modes",
+      "oracle": "Existing FixtureJournal/server markers and actual canvas saved pixels; testkit focus/input sentinel; no source-text or nonempty-only assertions",
+      "negative": "Page automation does not certify Chrome UI, file picker, custom canvas or an unqualified background raw route"
+    },
+    {
+      "id": "xwayland-existing-foreground",
+      "app": "GTK3 native_capabilities.py launched with GDK_BACKEND=x11 only inside disposable candidate DISPLAY; independent XWayland Source/Destination",
+      "route": "existing XWayland background only if validated capability; explicit foreground XTest/physical conflict boundary otherwise",
+      "action": "Foreground click/scroll and cross-window transfer with consent, capture exact XID/compositor address and source/destination; hold primary button to force refusal before takeover",
+      "oracle": "Actual GTK app journals and matched X11/compositor identity; intentional focus/cursor takeover labeled foreground; no silent fallback when requested background",
+      "negative": "XTest delivery alone is not isolation proof; held physical input refuses without retry"
+    },
+    {
+      "id": "xwayland-xpra-owned",
+      "app": "Fresh owned Xpra server/session and two separate GTK3 native_capabilities.py processes with GDK_BACKEND=x11 and private DISPLAY/journals",
+      "route": "explicit owned_session, never migrated existing XWayland windows",
+      "action": "Open owned session and connect returned private MCP socket, wait >10s idle beyond blocking-worker keepalive and verify private socket/app heartbeat, launch both GTK fixtures in same Xpra DISPLAY; explicitly desktop-scope foreground XTest drag within private server from source screen point to destination screen point; also activate a case-owned private D-Bus service that writes DISPLAY/GDK_BACKEND/HOME/XDG_RUNTIME_DIR to an app-owned journal; close session and prove resources removed",
+      "oracle": "Source offer-sent and Destination drop-received exact text/accepted=true, Xpra session/XIDs and saved journals, activated app inherits only private DISPLAY/GDK_BACKEND=x11/HOME/XDG_RUNTIME_DIR, no host physical focus/cursor events",
+      "negative": "Host existing window remains present/unsaved; owned session cannot claim it adopted that window"
+    },
+    {
+      "id": "lifecycle-and-policy",
+      "app": "Fresh GTK native fixture plus existing foreground/grab and native-observation Rust E2E suites",
+      "route": "background, foreground, selection and owned routes individually",
+      "action": "Target unmap/destruction during drag, cancellation/EOF with held key/button, stale geometry/target, two agent clients collision, third lane exhaustion, primary-client collision, lock/DPMS against private outputs only",
+      "oracle": "Exact structured refusal/partial/unknown with no replay, agent-owned held state released, physical held state retained, no wrong-target journal events; session revoke/disable leaves no plugin input capability",
+      "negative": "Never lock, DPMS, reconfigure or unload a module on the working desktop"
+    },
+    {
+      "id": "compositor-scene-revision",
+      "app": "Two real wl_subsurface children under a wl_shell-independent xdg_toplevel in scene_revision_fixture.c, plus separately focused native Sibling",
+      "route": "FRAMED desktop capture bound to compositor-origin epoch and monotonic view-tree revision",
+      "action": "Observe inventory/root plus children; request child set_position, place_below/above and input_region, then reassert identical input region, buffer scale/transform/offset, unset viewport and damage without changing state; separately change and restore viewport source/destination; after each capture, retry the old point with its old capture_id",
+      "oracle": "Actual hit/stack/region/viewport change and viewport restoration increment compositor/plugin shared scene_revision and stale capture refuses; identical pending/current reassert and damage-only repaint leave numeric revision stable AND old capture action succeeds; JSONL mutation journal and paired screenshots retained",
+      "negative": "Never substitute plugin-local screenshot counters or current-point-only hit checks for topology identity; popup map/reposition/dismiss and output-layout mutation must also advance revision"
+    },
+    {
+      "id": "primary-text-input-ime-wire",
+      "app": "Two actual Wayland client connections: text-input-v1 or v3 xdg_toplevel and separate input-method-v2, both bound to primary wl_seat of private candidate; independent Sibling window for blur/refocus",
+      "route": "real user-seat IME regression independent of synthetic agent seat; separate synthetic agent v3 stale-enabled/unavailable-IME resources in seat-isolation acceptance",
+      "action": "v1 activate before commit_state then commit_state; IME done-count commit_string; deactivate/reactivate with fresh state; v3 focus enter, enable+commit, IME commit_string+done, disable+commit/re-enable+commit; send stale IME serial, blur to Sibling and refocus same surface",
+      "oracle": "Protocol JSONL from both connections: v1 enter and IME activate/done precede initial commit_state; v1 client commit_string serial equals latest client serial; v3 done equals latest client commit count; Unicode committed exactly to actual client; stale serial yields no client commit; v1 IME reactivates on refocus; v3 IME waits for fresh enable+commit after leave/enter",
+      "negative": "A plugin synthetic seat test alone does not prove physical primary IME, and primary text input must not inherit or consume another seat's serial or enabled state"
+    },
+    {
+      "id": "agent-keyboard-and-preedit-lifecycle",
+      "app": "Independent real Wayland `agent-v3` and `keyboard-sibling` clients, each binding named Cua-Agent wl_keyboard; target also binds primary wl_keyboard; app-owned JSONL on both processes",
+      "route": "background press_key with shift modifier and synthetic-seat preedit via retained target session",
+      "action": "Send target-scoped Shift+a; observe real target enter/key/modifiers/release/leave and zero sibling protocol keyboard events, not just toolkit-ignored keys; release target keyboard resource or unmap target and repeat/refuse safely; then send nonempty v3 preedit and terminate only its owned Driver session",
+      "oracle": "Target raw evdev a=30 and Shift=42 events and depressed modifier transitions, independent sibling journal has no enter/key/modifiers, physical keyboard/primary cursor/focus sentinel unchanged; after release/unmap no foreign-client events; preedit owner EOF immediately yields empty preedit-string plus done and synthetic leave without five-second delayed ghost composition",
+      "negative": "GTK text-only journal cannot hide compositor broadcast leaks; losing the lease while preedit remains visible or sending events after keyboard resource release fails acceptance"
+    },
+    {
+      "id": "omarchy-service-identity",
+      "app": "Candidate-only rootless mount/user namespace with private compositor, package bindings and isolated user manager or direct cua-omarchy serve; never host systemctl user unit",
+      "route": "one local-only per-user service and explicit agent MCP socket",
+      "action": "With validated private UWSM Wayland socket+Hyprland PID, launch candidate service and connect two agents; inspect status/revoke/disable and restart scope without editing physical agent configs; retain unrelated configurations",
+      "oracle": "Attested service MainPID, /proc environment, pidfile, compositor identity and Unix socket match private candidate; no TCP listener even with inherited CUA_DRIVER_ENVELOPE_HTTP_PORT; source/package hashes and matched rollback set recorded",
+      "negative": "Caller vs user-manager compositor/profile identity mismatch must refuse BEFORE unit mutation; no fallback to physical canonical endpoint or user-home config"
+    }
+  ]
+}

@@ -17,8 +17,64 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 const CANCELLATION_POLL: Duration = Duration::from_millis(25);
 const TEXT_ACTION_GAP: Duration = Duration::from_millis(25);
 const MAX_PACKET: usize = 2048;
+const TEXT_READY_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_LANES: usize = 2;
 const MAX_STALE_GEOMETRY_RETRIES: usize = 1;
+
+const MAX_INVENTORY_ROWS: usize = 512;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameRow {
+    pub pid: u32,
+    pub address: u64,
+    pub surface_id: u32,
+    pub lifetime: String,
+    pub root_geometry: [f64; 6],
+    pub box_: [f64; 4],
+    pub popup: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameInventory {
+    pub epoch: String,
+    pub tree_revision: u64,
+    pub rows: Vec<FrameRow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameHit {
+    pub epoch: String,
+    pub tree_revision: u64,
+    pub hit: FrameRow,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowCaptureProof {
+    pub epoch: String,
+    pub tree_revision: u64,
+    pub root: FrameRow,
+    pub hit: FrameRow,
+    pub xid: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct XWaylandCaptureProof {
+    pub epoch: String,
+    pub tree_revision: u64,
+    pub xid: u32,
+    pub root: FrameRow,
+}
+
+#[derive(Debug)]
+pub(crate) struct SemanticTargetUnavailable(pub String);
+
+impl std::fmt::Display for SemanticTargetUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "semantic target unavailable: {}", self.0)
+    }
+}
+
+impl std::error::Error for SemanticTargetUnavailable {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DeliveryRoute {
@@ -121,7 +177,7 @@ impl ActionCancellation {
         (CancelOnDrop(cancellation.clone()), cancellation)
     }
 
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         if self.0.load(Ordering::Acquire) {
             return Err(ActionCancelled.into());
         }
@@ -236,6 +292,7 @@ impl InputProtocol {
 /// normalizes physical buffers to logical dimensions; tool routes undo only
 /// the later preview resize (or zoom), so no additional scale division belongs
 /// here. TARGET bounds and revision remain authoritative at dispatch.
+#[derive(Clone)]
 pub enum Action {
     Activate,
     TextKey {
@@ -248,9 +305,30 @@ pub enum Action {
         button: u32,
         count: usize,
     },
+    ModifiedClick {
+        x: f64,
+        y: f64,
+        button: u32,
+        count: usize,
+        modifiers: Vec<String>,
+    },
+    Hover {
+        x: f64,
+        y: f64,
+    },
+    PreciseScroll {
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+    },
     Key {
         key: String,
         modifiers: Vec<String>,
+    },
+    /// Commit through the exact target's enabled text-input on this agent seat.
+    Text {
+        text: String,
     },
     Scroll {
         point: Option<(f64, f64)>,
@@ -261,6 +339,37 @@ pub enum Action {
         from: (f64, f64),
         to: (f64, f64),
         duration_ms: u64,
+    },
+    PathDrag {
+        points: Vec<(f64, f64)>,
+        duration_ms: u64,
+        modifiers: Vec<String>,
+    },
+    /// Only a point grounded in a captured desktop frame may target a popup.
+    /// A normal toplevel capture must not authorize hidden popup input.
+    Frame {
+        point: (f64, f64),
+        hit: FrameHit,
+        action: Box<Action>,
+    },
+    /// A named window export must preserve its captured root and the exact
+    /// child hit under the point through the compositor's action dispatch.
+    WindowCapture {
+        point: (f64, f64),
+        proof: WindowCaptureProof,
+        action: Box<Action>,
+    },
+    /// An exported XWayland root is bound by compositor surface lifetime
+    /// and XID, then delivered only through the guarded primary seat.
+    XWaylandCaptureForeground {
+        point: (f64, f64),
+        proof: WindowCaptureProof,
+        action: Box<Action>,
+    },
+    /// A compositor-attested XID, never an XTest or native agent-seat fallback.
+    XWaylandForeground {
+        xid: u32,
+        action: Box<Action>,
     },
 }
 
@@ -490,6 +599,62 @@ impl Client {
         self.send_packet(packet, deadline)?;
         self.receive(deadline)
     }
+    fn await_text_input(&mut self, token: &str, revision: u64) -> Result<Option<Value>> {
+        let deadline = Instant::now() + TEXT_READY_TIMEOUT;
+        self.sequence = self.sequence.checked_add(1).context("sequence exhausted")?;
+        let focus = self.action_request_until(
+            &format!("TEXT_FOCUS {} {token} {revision}", self.sequence),
+            deadline,
+        )?;
+        if focus["ok"] == false {
+            return Ok(Some(focus));
+        }
+        if focus["phase"] != "focus_sent" {
+            return Err(unknown_dispatch(
+                anyhow::anyhow!("text focus acknowledgement is invalid"),
+                0,
+            ));
+        }
+        loop {
+            self.cancellation.check()?;
+            if Instant::now() >= deadline {
+                return Ok(Some(json!({"ok":false,"code":"text_input_unavailable",
+                    "detail":"text_input_unavailable","effect":"refused","phase":"focus_sent"})));
+            }
+            self.sequence = self.sequence.checked_add(1).context("sequence exhausted")?;
+            let status = self.action_request_until(
+                &format!("TEXT_STATUS {} {token} {revision}", self.sequence),
+                deadline,
+            )?;
+            if status["ok"] == false {
+                return Ok(Some(status));
+            }
+            match status["ready"].as_bool() {
+                Some(true) => return Ok(None),
+                Some(false) => std::thread::sleep(
+                    CANCELLATION_POLL.min(deadline.saturating_duration_since(Instant::now())),
+                ),
+                None => {
+                    return Err(unknown_dispatch(
+                        anyhow::anyhow!("text-input readiness result is malformed"),
+                        0,
+                    ))
+                }
+            }
+        }
+    }
+
+    fn action_request_until(&self, packet: &str, deadline: Instant) -> Result<Value> {
+        self.send_packet(packet, deadline).map_err(|error| {
+            if error.is::<ActionCancelled>() {
+                error
+            } else {
+                unknown_dispatch(error, 0)
+            }
+        })?;
+        self.receive(deadline)
+            .map_err(|error| unknown_dispatch(error, 0))
+    }
 
     fn send_packet(&self, packet: &str, deadline: Instant) -> Result<()> {
         ensure!(
@@ -577,15 +742,43 @@ impl Client {
         ensure!(self.lane.is_some(), "isolated input lane is not claimed");
         self.check_route(route)?;
         ensure!(
+            route == DeliveryRoute::Background
+                || !matches!(&action, Action::Frame { .. } | Action::WindowCapture { .. }),
+            "capture-bound input requires isolated native route"
+        );
+        ensure!(
             route == DeliveryRoute::Foreground || !matches!(&action, Action::Activate),
             "action requires foreground input"
+        );
+        ensure!(
+            route == DeliveryRoute::Foreground
+                || !matches!(
+                    &action,
+                    Action::XWaylandForeground { .. } | Action::XWaylandCaptureForeground { .. }
+                ),
+            "XWayland requires guarded foreground input"
         );
         ensure!(
             self.delivery_route.is_none_or(|bound| bound == route),
             "input route is immutable"
         );
         self.delivery_route = Some(route);
-        let is_drag = matches!(&action, Action::Drag { .. });
+        let is_drag = match &action {
+            Action::Drag { .. } | Action::PathDrag { .. } => true,
+            Action::WindowCapture { action, .. } => matches!(
+                action.as_ref(),
+                Action::Drag { .. } | Action::PathDrag { .. }
+            ),
+            Action::XWaylandCaptureForeground { action, .. } => matches!(
+                action.as_ref(),
+                Action::Drag { .. } | Action::PathDrag { .. }
+            ),
+            Action::XWaylandForeground { action, .. } => matches!(
+                action.as_ref(),
+                Action::Drag { .. } | Action::PathDrag { .. }
+            ),
+            _ => false,
+        };
         let mut started = started;
         for attempt in 0..=MAX_STALE_GEOMETRY_RETRIES {
             // Foreground's first attestation covers the whole logical call.
@@ -609,10 +802,20 @@ impl Client {
                 width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0,
                 "invalid target geometry"
             );
+            if action.has_seat_text() {
+                if let Some(refusal) = self.await_text_input(&token, revision)? {
+                    return Ok(refusal);
+                }
+            }
             self.sequence = self.sequence.checked_add(1).context("sequence exhausted")?;
             let packet = action.packet(self.sequence, &token, revision, width, height)?;
-            let mut reply =
-                self.dispatch_routed_with_started(&packet, is_drag, &mut started, route)?;
+            let mut reply = self.dispatch_routed_with_started(
+                &packet,
+                is_drag,
+                &mut started,
+                route,
+                action.acknowledgement(route),
+            )?;
             if self.protocol == InputProtocol::Production
                 && reply["ok"] == false
                 && reply["code"] == "stale_geometry"
@@ -641,6 +844,7 @@ impl Client {
         is_drag: bool,
         started: &mut Option<tokio::sync::oneshot::Sender<()>>,
         route: DeliveryRoute,
+        acknowledgement: &str,
     ) -> Result<Value> {
         let deadline = Instant::now() + TIMEOUT;
         self.send_packet(packet, deadline).map_err(|error| {
@@ -680,7 +884,7 @@ impl Client {
             ));
         }
         if reply["ok"] == true {
-            if reply["effect"] != "unverifiable" || reply["route"] != route.acknowledgement() {
+            if reply["effect"] != "unverifiable" || reply["route"] != acknowledgement {
                 return Err(unknown_dispatch(
                     anyhow::anyhow!("invalid action acknowledgement"),
                     u32::from(acknowledged),
@@ -707,17 +911,116 @@ impl Client {
         let target = self.request(&self.target_packet_routed(action, route))?;
         if target["ok"] == true {
             validate_target_route(&target, route)?;
+            if let Action::Frame { hit, .. } = action {
+                ensure!(
+                    target["scope"] == "desktop_frame"
+                        && target["hit_surface"].as_u64() == Some(u64::from(hit.hit.surface_id)),
+                    "frame target surface changed"
+                );
+            }
+            if let Action::WindowCapture { proof, .. } = action {
+                ensure!(
+                    target["scope"] == "window_capture"
+                        && target["hit_surface"].as_u64() == Some(u64::from(proof.hit.surface_id)),
+                    "captured window target surface changed"
+                );
+            }
+            if let Action::XWaylandCaptureForeground { proof, .. } = action {
+                ensure!(
+                    target["scope"] == "window_capture"
+                        && target["hit_surface"].as_u64() == Some(u64::from(proof.root.surface_id)),
+                    "XWayland captured root changed"
+                );
+            }
         }
         Ok(target)
     }
 
     fn target_packet_routed(&self, action: &Action, route: DeliveryRoute) -> String {
-        let command = match route {
-            DeliveryRoute::Background => "TARGET",
-            DeliveryRoute::Foreground => "FOREGROUND_TARGET",
+        let command = match (route, action) {
+            (DeliveryRoute::Background, Action::Frame { .. }) => "FRAME_TARGET",
+            (DeliveryRoute::Background, Action::WindowCapture { .. }) => "WINDOW_CAPTURE_TARGET",
+            (DeliveryRoute::Background, _) => "TARGET",
+            (DeliveryRoute::Foreground, Action::XWaylandCaptureForeground { .. }) => {
+                "XWAYLAND_CAPTURE_FOREGROUND_TARGET"
+            }
+            (DeliveryRoute::Foreground, Action::XWaylandForeground { .. }) => {
+                "XWAYLAND_FOREGROUND_TARGET"
+            }
+            (DeliveryRoute::Foreground, _) => "FOREGROUND_TARGET",
         };
         let target = format!("{command} {} {:x}", self.pid, self.address);
-        if self.protocol == InputProtocol::Production {
+        if let Action::Frame {
+            point: (x, y), hit, ..
+        } = action
+        {
+            let row = &hit.hit;
+            format!("{target} {cap} {x} {y} {epoch} {revision} {surface} {lifetime} {bx} {by} {bw} {bh} {popup}",
+                cap = action.capability(), epoch = hit.epoch, revision = hit.tree_revision,
+                surface = row.surface_id, lifetime = row.lifetime,
+                bx = row.box_[0], by = row.box_[1], bw = row.box_[2], bh = row.box_[3],
+                popup = u8::from(row.popup))
+        } else if let Action::WindowCapture {
+            point: (x, y),
+            proof,
+            ..
+        } = action
+        {
+            let root = &proof.root;
+            let hit = &proof.hit;
+            let g = &root.root_geometry;
+            let b = &hit.box_;
+            format!(
+                "{target} {cap} {x} {y} {epoch} {revision} {root_id} {root_lifetime} \
+                {g0} {g1} {g2} {g3} {g4} {g5} {hit_id} {hit_lifetime} {b0} {b1} {b2} {b3} {popup}",
+                cap = action.capability(),
+                epoch = proof.epoch,
+                revision = proof.tree_revision,
+                root_id = root.surface_id,
+                root_lifetime = root.lifetime,
+                g0 = g[0],
+                g1 = g[1],
+                g2 = g[2],
+                g3 = g[3],
+                g4 = g[4],
+                g5 = g[5],
+                hit_id = hit.surface_id,
+                hit_lifetime = hit.lifetime,
+                b0 = b[0],
+                b1 = b[1],
+                b2 = b[2],
+                b3 = b[3],
+                popup = u8::from(hit.popup)
+            )
+        } else if let Action::XWaylandCaptureForeground {
+            point: (x, y),
+            proof,
+            ..
+        } = action
+        {
+            let root = &proof.root;
+            let g = &root.root_geometry;
+            let xid = proof
+                .xid
+                .expect("XWayland capture proof validated before dispatch");
+            format!(
+                "{target} {cap} {xid} {x} {y} {epoch} {revision} {root_id} {root_lifetime} \
+                {g0} {g1} {g2} {g3} {g4} {g5}",
+                cap = action.capability(),
+                epoch = proof.epoch,
+                revision = proof.tree_revision,
+                root_id = root.surface_id,
+                root_lifetime = root.lifetime,
+                g0 = g[0],
+                g1 = g[1],
+                g2 = g[2],
+                g3 = g[3],
+                g4 = g[4],
+                g5 = g[5]
+            )
+        } else if let Action::XWaylandForeground { xid, .. } = action {
+            format!("{target} {} {xid}", action.capability())
+        } else if self.protocol == InputProtocol::Production {
             format!("{target} {}", action.capability())
         } else {
             target
@@ -725,14 +1028,52 @@ impl Client {
     }
 }
 
+fn modifier_mask(modifiers: &[String]) -> Result<u8> {
+    let mut mask = 0;
+    for modifier in modifiers {
+        mask |= match modifier.to_ascii_lowercase().as_str() {
+            "shift" => 1,
+            "ctrl" | "control" => 2,
+            "alt" | "option" => 4,
+            "super" | "meta" | "cmd" | "command" | "win" => 8,
+            _ => bail!("unsupported modifier"),
+        };
+    }
+    Ok(mask)
+}
+
 impl Action {
+    fn has_seat_text(&self) -> bool {
+        match self {
+            Self::Text { .. } => true,
+            Self::Frame { action, .. } => action.has_seat_text(),
+            _ => false,
+        }
+    }
+
+    fn acknowledgement(&self, route: DeliveryRoute) -> &'static str {
+        match self {
+            Self::Text { .. } => "seat_text_input",
+            Self::Frame { action, .. }
+            | Self::WindowCapture { action, .. }
+            | Self::XWaylandCaptureForeground { action, .. }
+            | Self::XWaylandForeground { action, .. } => action.acknowledgement(route),
+            _ => route.acknowledgement(),
+        }
+    }
+
     fn capability(&self) -> u8 {
         match self {
             Self::Activate => 16,
-            Self::Click { .. } => 1,
+            Self::Click { .. } | Self::ModifiedClick { .. } | Self::Hover { .. } => 1,
             Self::Key { .. } | Self::TextKey { .. } => 2,
-            Self::Scroll { .. } => 4,
-            Self::Drag { .. } => 8,
+            Self::Text { .. } => 32,
+            Self::Scroll { .. } | Self::PreciseScroll { .. } => 4,
+            Self::Drag { .. } | Self::PathDrag { .. } => 8,
+            Self::Frame { action, .. }
+            | Self::WindowCapture { action, .. }
+            | Self::XWaylandCaptureForeground { action, .. }
+            | Self::XWaylandForeground { action, .. } => action.capability(),
         }
     }
 
@@ -744,19 +1085,103 @@ impl Action {
         width: f64,
         height: f64,
     ) -> Result<String> {
-        let point = |x: f64, y: f64| -> Result<()> {
-            ensure!(
-                x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0 && x < width && y < height,
-                "input point outside attested logical target geometry"
-            );
+        let (action, frame_point, window_source_only) = match self {
+            Self::Frame { point, action, .. } => {
+                ensure!(
+                    matches!(
+                        action.as_ref(),
+                        Self::Click { .. }
+                            | Self::Scroll { .. }
+                            | Self::Hover { .. }
+                            | Self::ModifiedClick { .. }
+                            | Self::PreciseScroll { .. }
+                            | Self::Text { .. }
+                    ),
+                    "desktop-frame action must be a point operation"
+                );
+                (action.as_ref(), Some(*point), false)
+            }
+            Self::WindowCapture { point, action, .. } => {
+                ensure!(
+                    matches!(
+                        action.as_ref(),
+                        Self::Click { .. }
+                            | Self::ModifiedClick { .. }
+                            | Self::Hover { .. }
+                            | Self::Scroll { .. }
+                            | Self::PreciseScroll { .. }
+                            | Self::Drag { .. }
+                            | Self::PathDrag { .. }
+                    ),
+                    "window capture action requires a captured pointer point"
+                );
+                (action.as_ref(), Some(*point), true)
+            }
+            Self::XWaylandCaptureForeground { point, action, .. } => {
+                ensure!(
+                    matches!(
+                        action.as_ref(),
+                        Self::Click { .. }
+                            | Self::ModifiedClick { .. }
+                            | Self::Hover { .. }
+                            | Self::Scroll { .. }
+                            | Self::PreciseScroll { .. }
+                            | Self::Drag { .. }
+                            | Self::PathDrag { .. }
+                    ),
+                    "XWayland captured action requires physical pointer input"
+                );
+                (action.as_ref(), Some(*point), true)
+            }
+            Self::XWaylandForeground { action, .. } => {
+                ensure!(
+                    !matches!(
+                        action.as_ref(),
+                        Self::Frame { .. }
+                            | Self::WindowCapture { .. }
+                            | Self::XWaylandCaptureForeground { .. }
+                            | Self::XWaylandForeground { .. }
+                            | Self::Text { .. }
+                    ),
+                    "XWayland foreground action requires physical input"
+                );
+                (action.as_ref(), None, false)
+            }
+            action => (action, None, false),
+        };
+        let mut point_index = 0;
+        let mut point = |x: f64, y: f64| -> Result<()> {
+            ensure!(x.is_finite() && y.is_finite(), "invalid input point");
+            if let Some(captured) = frame_point.filter(|_| !window_source_only || point_index == 0)
+            {
+                ensure!((x, y) == captured, "input point changed after capture");
+            } else {
+                ensure!(
+                    x >= 0.0 && y >= 0.0 && x < width && y < height,
+                    "input point outside attested logical target geometry"
+                );
+            }
+            point_index += 1;
             Ok(())
         };
         let prefix = format!("{sequence} {token} {revision}");
-        Ok(match self {
+        Ok(match action {
             Self::Activate => format!("ACTIVATE {prefix}"),
             Self::TextKey { keycode, shift } => {
                 ensure!((1..=57).contains(keycode), "unsupported text key");
                 format!("KEY {prefix} {keycode} {}", u8::from(*shift))
+            }
+            Self::Text { text } => {
+                ensure!(
+                    !text.is_empty() && text.len() <= 900 && !text.contains('\0'),
+                    "native text requires 1–900 UTF-8 bytes without NUL"
+                );
+                let mut packet = format!("TEXT {prefix} ");
+                use std::fmt::Write as _;
+                for byte in text.bytes() {
+                    write!(&mut packet, "{byte:02x}")?;
+                }
+                packet
             }
             Self::Click {
                 x,
@@ -777,19 +1202,46 @@ impl Action {
                 };
                 format!("CLICK {prefix} {x} {y} {button} {count}")
             }
+            Self::ModifiedClick {
+                x,
+                y,
+                button,
+                count,
+                modifiers,
+            } => {
+                point(*x, *y)?;
+                ensure!((1..=2).contains(count), "unsupported click count");
+                let button = match *button {
+                    1 => 272,
+                    2 => 274,
+                    3 => 273,
+                    _ => bail!("unsupported click button"),
+                };
+                format!(
+                    "MOD_CLICK {prefix} {x} {y} {button} {count} {}",
+                    modifier_mask(modifiers)?
+                )
+            }
+            Self::Hover { x, y } => {
+                point(*x, *y)?;
+                format!("HOVER {prefix} {x} {y}")
+            }
+            Self::PreciseScroll { x, y, dx, dy } => {
+                point(*x, *y)?;
+                ensure!(
+                    dx.is_finite()
+                        && dy.is_finite()
+                        && (*dx != 0.0 || *dy != 0.0)
+                        && dx.abs() <= 1000.0
+                        && dy.abs() <= 1000.0,
+                    "unsupported precise scroll"
+                );
+                format!("SCROLL_PRECISE {prefix} {x} {y} {dx} {dy}")
+            }
             Self::Key { key, modifiers } => {
                 let keycode = super::key_to_evdev(key)
                     .context("key has no evdev mapping; Unicode text is unsupported")?;
-                let mut mask = 0;
-                for modifier in modifiers {
-                    mask |= match modifier.to_ascii_lowercase().as_str() {
-                        "shift" => 1,
-                        "ctrl" | "control" => 2,
-                        "alt" | "option" => 4,
-                        "super" | "meta" | "cmd" | "command" | "win" => 8,
-                        _ => bail!("unsupported modifier"),
-                    };
-                }
+                let mask = modifier_mask(modifiers)?;
                 format!("KEY {prefix} {keycode} {mask}")
             }
             Self::Scroll {
@@ -823,6 +1275,36 @@ impl Action {
                 );
                 format!("DRAG {prefix} {x1} {y1} {x2} {y2} {duration_ms}")
             }
+            Self::PathDrag {
+                points,
+                duration_ms,
+                modifiers,
+            } => {
+                ensure!(
+                    (2..=16).contains(&points.len()),
+                    "path drag requires 2–16 points"
+                );
+                ensure!(
+                    (50..=2000).contains(duration_ms),
+                    "path drag duration must be 50–2000 ms"
+                );
+                let mut packet = format!(
+                    "PATH_DRAG {prefix} {duration_ms} {} {}",
+                    modifier_mask(modifiers)?,
+                    points.len()
+                );
+                for &(x, y) in points {
+                    point(x, y)?;
+                    use std::fmt::Write as _;
+                    write!(&mut packet, " {x} {y}")?;
+                }
+                ensure!(packet.len() <= MAX_PACKET, "path drag packet too large");
+                packet
+            }
+            Self::Frame { .. }
+            | Self::WindowCapture { .. }
+            | Self::XWaylandCaptureForeground { .. }
+            | Self::XWaylandForeground { .. } => unreachable!("bound action unwrapped above"),
         })
     }
 }
@@ -930,6 +1412,258 @@ pub fn cleanup_runtime(prefix: &str) {
         cleanup_session(&owner);
     }
 }
+fn inspection_client(pid: u32, address: u64) -> Result<Client> {
+    ensure!(
+        protocol() == InputProtocol::Production,
+        "production input v3 required"
+    );
+    let path = socket_path(0)?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::UNIX,
+        socket2::Type::from(libc::SOCK_SEQPACKET),
+        None,
+    )?;
+    socket.connect_timeout(&socket2::SockAddr::unix(&path)?, TIMEOUT)?;
+    socket.set_nonblocking(true)?;
+    let client = Client {
+        socket,
+        cancellation: ActionCancellation::default(),
+        protocol: InputProtocol::Production,
+        foreground_supported: false,
+        delivery_route: None,
+        lane: None,
+        owner: String::new(),
+        path,
+        pid,
+        address,
+        epoch: String::new(),
+        challenge: String::new(),
+        sequence: 0,
+    };
+    client.attest()?;
+    let hello = client.request("HELLO")?;
+    ensure!(
+        hello["ok"] == true && hello["protocol"] == 3,
+        "input v3 required"
+    );
+    hex_field(&hello, "epoch")?;
+    Ok(client)
+}
+
+fn frame_row(value: &Value) -> Result<FrameRow> {
+    let pid = u32::try_from(value["pid"].as_u64().context("missing frame pid")?)?;
+    let address = u64::from_str_radix(
+        value["address"].as_str().context("missing frame address")?,
+        16,
+    )?;
+    let surface_id = u32::try_from(
+        value["surface_id"]
+            .as_u64()
+            .context("missing frame surface id")?,
+    )?;
+    let lifetime = hex_field(value, "lifetime")?;
+    let geometry = value["root_geometry"]
+        .as_array()
+        .context("missing root geometry")?;
+    let box_values = value["box"].as_array().context("missing frame box")?;
+    ensure!(
+        geometry.len() == 6 && box_values.len() == 4,
+        "invalid frame geometry"
+    );
+    let mut root_geometry = [0.0; 6];
+    let mut box_ = [0.0; 4];
+    for (dest, source) in root_geometry.iter_mut().zip(geometry) {
+        *dest = source.as_f64().context("invalid root coordinate")?;
+    }
+    for (dest, source) in box_.iter_mut().zip(box_values) {
+        *dest = source.as_f64().context("invalid frame coordinate")?;
+    }
+    ensure!(
+        root_geometry
+            .iter()
+            .chain(box_.iter())
+            .all(|v| v.is_finite())
+            && root_geometry[2] > 0.0
+            && root_geometry[3] > 0.0
+            && box_[2] > 0.0
+            && box_[3] > 0.0
+            && pid != 0
+            && address != 0
+            && surface_id != 0,
+        "invalid frame identity or geometry"
+    );
+    Ok(FrameRow {
+        pid,
+        address,
+        surface_id,
+        lifetime,
+        root_geometry,
+        box_,
+        popup: value["popup"]
+            .as_bool()
+            .context("missing frame popup flag")?,
+    })
+}
+
+/// Read an entire compositor-pinned scene snapshot, refusing torn or truncated pages.
+pub fn frame_inventory() -> Result<FrameInventory> {
+    let client = inspection_client(0, 0)?;
+    let begin = client.request("FRAME_INVENTORY_BEGIN")?;
+    ensure!(begin["ok"] == true, "frame inventory refused: {begin}");
+    let epoch = hex_field(&begin, "epoch")?;
+    let inventory = hex_field(&begin, "inventory")?;
+    let tree_revision = begin["tree_revision"]
+        .as_u64()
+        .context("missing tree revision")?;
+    let count = usize::try_from(begin["count"].as_u64().context("missing inventory count")?)?;
+    ensure!(count <= MAX_INVENTORY_ROWS, "frame inventory too large");
+    let mut rows = Vec::with_capacity(count);
+    while rows.len() < count {
+        let offset = rows.len();
+        let page = client.request(&format!("FRAME_INVENTORY_PAGE {inventory} {offset}"))?;
+        ensure!(page["ok"] == true, "frame inventory changed: {page}");
+        ensure!(
+            page["tree_revision"].as_u64() == Some(tree_revision),
+            "frame inventory revision changed"
+        );
+        let next = usize::try_from(page["next"].as_u64().context("missing inventory offset")?)?;
+        let page_rows = page["rows"].as_array().context("missing inventory rows")?;
+        ensure!(
+            next > offset && next <= count && page_rows.len() == next - offset,
+            "invalid inventory pagination"
+        );
+        for row in page_rows {
+            rows.push(frame_row(row)?);
+        }
+    }
+    Ok(FrameInventory {
+        epoch,
+        tree_revision,
+        rows,
+    })
+}
+
+/// Absence of the production plugin is distinct from a malformed live response.
+pub fn frame_inventory_if_available() -> Result<Option<FrameInventory>> {
+    if !enabled() || protocol() != InputProtocol::Production {
+        return Ok(None);
+    }
+    frame_inventory().map(Some)
+}
+
+pub fn inspect_frame_hit(pid: u32, address: u64, point: (f64, f64)) -> Result<FrameHit> {
+    ensure!(
+        pid != 0 && address != 0 && point.0.is_finite() && point.1.is_finite(),
+        "invalid frame hit request"
+    );
+    let client = inspection_client(pid, address)?;
+    let reply = client.request(&format!(
+        "INSPECT_FRAME_HIT {pid} {address:x} {} {}",
+        point.0, point.1
+    ))?;
+    ensure!(reply["ok"] == true, "frame hit refused: {reply}");
+    let hit = frame_row(&reply["hit"])?;
+    ensure!(
+        hit.pid == pid && hit.address == address,
+        "frame hit target changed"
+    );
+    Ok(FrameHit {
+        epoch: hex_field(&reply, "epoch")?,
+        tree_revision: reply["tree_revision"]
+            .as_u64()
+            .context("missing frame revision")?,
+        hit,
+    })
+}
+
+/// Window-export inspection uses the exact root/child tree without requiring
+/// desktop topmost visibility; it still refuses popup surfaces absent in that export.
+pub fn inspect_window_hit(pid: u32, address: u64, point: (f64, f64)) -> Result<WindowCaptureProof> {
+    ensure!(
+        pid != 0 && address != 0 && point.0.is_finite() && point.1.is_finite(),
+        "invalid window capture hit request"
+    );
+    let client = inspection_client(pid, address)?;
+    let reply = client.request(&format!(
+        "INSPECT_WINDOW_HIT {pid} {address:x} {} {}",
+        point.0, point.1
+    ))?;
+    ensure!(reply["ok"] == true, "window capture hit refused: {reply}");
+    let root = frame_row(&reply["root"])?;
+    let hit = frame_row(&reply["hit"])?;
+    ensure!(
+        root.pid == pid
+            && root.address == address
+            && hit.pid == pid
+            && hit.address == address
+            && !root.popup
+            && !hit.popup
+            && root.root_geometry == hit.root_geometry,
+        "window capture root/child identity changed"
+    );
+    let xid = match reply.get("xid").context("missing window target kind")? {
+        Value::Null => None,
+        value => Some(u32::try_from(
+            value.as_u64().context("invalid window XID")?,
+        )?),
+    };
+    ensure!(
+        xid.is_none_or(|xid| xid != 0 && hit == root),
+        "XWayland capture must identify its exact root"
+    );
+    Ok(WindowCaptureProof {
+        epoch: hex_field(&reply, "epoch")?,
+        tree_revision: reply["tree_revision"]
+            .as_u64()
+            .context("missing window tree revision")?,
+        root,
+        hit,
+        xid,
+    })
+}
+
+pub fn inspect_xwayland_capture(pid: u32, address: u64) -> Result<XWaylandCaptureProof> {
+    ensure!(pid != 0 && address != 0, "exact XWayland capture required");
+    let client = inspection_client(pid, address)?;
+    let reply = client.request(&format!("INSPECT_XWAYLAND_CAPTURE {pid} {address:x}"))?;
+    ensure!(
+        reply["ok"] == true,
+        "XWayland capture identity refused: {reply}"
+    );
+    let root = frame_row(&reply["root"])?;
+    let xid = u32::try_from(reply["xid"].as_u64().context("missing XWayland XID")?)?;
+    ensure!(
+        xid != 0 && root.pid == pid && root.address == address && !root.popup,
+        "XWayland captured root identity changed"
+    );
+    Ok(XWaylandCaptureProof {
+        epoch: hex_field(&reply, "epoch")?,
+        tree_revision: reply["tree_revision"]
+            .as_u64()
+            .context("missing window tree revision")?,
+        xid,
+        root,
+    })
+}
+
+/// Read-only exact XWayland identity from the matching compositor. This does
+/// not claim an input lane or authorize delivery to the X server.
+pub(crate) fn inspect_xwayland(pid: u32, address: u64) -> Result<u32> {
+    ensure!(pid != 0 && address != 0, "exact XWayland target required");
+    let client = inspection_client(pid, address)?;
+    let reply = client.request(&format!("INSPECT_XWAYLAND {pid} {address:x}"))?;
+    ensure!(
+        reply["ok"] == true
+            && reply["pid"].as_u64() == Some(u64::from(pid))
+            && reply["address"].as_str() == Some(format!("{address:x}").as_str()),
+        "XWayland exact compositor identity refused: {reply}"
+    );
+    let xid = reply["xwayland_xid"]
+        .as_u64()
+        .context("missing XWayland XID")?;
+    ensure!((1..=u32::MAX as u64).contains(&xid), "invalid XWayland XID");
+    Ok(xid as u32)
+}
 
 /// Only same-lifecycle actions serialize. Independent authenticated sessions
 /// use independent sockets/seats and may overlap. Never retry unknown effects.
@@ -961,6 +1695,157 @@ pub(crate) fn execute_with_started(
         DeliveryRoute::Background,
     )
 }
+/// The caller has verified this point against its current captured desktop
+/// frame, occupied output and exact native window. Plugin re-hits on dispatch.
+pub(crate) fn execute_frame(
+    owner: Option<String>,
+    pid: u32,
+    address: u64,
+    action: Action,
+    frame_point: (f64, f64),
+    hit: FrameHit,
+    cancellation: ActionCancellation,
+) -> Result<Value> {
+    ensure!(
+        frame_point.0.is_finite()
+            && frame_point.1.is_finite()
+            && hit.hit.pid == pid
+            && hit.hit.address == address
+            && protocol() == InputProtocol::Production,
+        "invalid captured desktop-frame identity"
+    );
+    let width = hit.hit.root_geometry[2];
+    let height = hit.hit.root_geometry[3];
+    let frame_action = Action::Frame {
+        point: frame_point,
+        hit,
+        action: Box::new(action),
+    };
+    // Reject invalid points/actions before minting a one-time compositor grant.
+    frame_action.packet(1, "0123456789abcdef0123456789abcdef", 1, width, height)?;
+    execute_routed(
+        owner,
+        pid,
+        address,
+        frame_action,
+        None,
+        cancellation,
+        DeliveryRoute::Background,
+    )
+}
+
+/// Bind an observed window-export root and child hit to the one admitted
+/// action. An uncaptured popup or same-geometry surface replacement refuses.
+pub(crate) fn execute_window_capture(
+    owner: Option<String>,
+    pid: u32,
+    address: u64,
+    action: Action,
+    point: (f64, f64),
+    proof: WindowCaptureProof,
+    cancellation: ActionCancellation,
+) -> Result<Value> {
+    ensure!(
+        protocol() == InputProtocol::Production && proof.xid.is_none(),
+        "native capture requires native target"
+    );
+    validate_capture_proof(&proof, pid, address, point)?;
+    let width = proof.root.root_geometry[2];
+    let height = proof.root.root_geometry[3];
+    let action = Action::WindowCapture {
+        point,
+        proof,
+        action: Box::new(action),
+    };
+    action.packet(1, "0123456789abcdef0123456789abcdef", 1, width, height)?;
+    execute_routed(
+        owner,
+        pid,
+        address,
+        action,
+        None,
+        cancellation,
+        DeliveryRoute::Background,
+    )
+}
+
+fn validate_capture_proof(
+    proof: &WindowCaptureProof,
+    pid: u32,
+    address: u64,
+    point: (f64, f64),
+) -> Result<()> {
+    let row = &proof.root;
+    ensure!(
+        pid != 0
+            && address != 0
+            && row.pid == pid
+            && row.address == address
+            && proof.hit.pid == pid
+            && proof.hit.address == address
+            && !row.popup
+            && !proof.hit.popup
+            && row.root_geometry == proof.hit.root_geometry
+            && row.root_geometry.iter().all(|value| value.is_finite())
+            && proof.hit.box_.iter().all(|value| value.is_finite())
+            && row.root_geometry[2] > 0.0
+            && row.root_geometry[3] > 0.0
+            && proof.hit.box_[2] > 0.0
+            && proof.hit.box_[3] > 0.0
+            && proof.xid.is_none_or(|xid| xid != 0 && proof.hit == *row)
+            && point.0.is_finite()
+            && point.1.is_finite()
+            && point.0 >= 0.0
+            && point.1 >= 0.0
+            && point.0 < row.root_geometry[2]
+            && point.1 < row.root_geometry[3],
+        "invalid exact captured endpoint"
+    );
+    for token in [&proof.epoch, &row.lifetime, &proof.hit.lifetime] {
+        ensure!(
+            token.len() == 32
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "invalid captured surface lifetime"
+        );
+    }
+    Ok(())
+}
+
+fn append_capture_endpoint(packet: &mut String, proof: &WindowCaptureProof, point: (f64, f64)) {
+    use std::fmt::Write as _;
+    let row = &proof.root;
+    let hit = &proof.hit;
+    let g = &row.root_geometry;
+    let b = &hit.box_;
+    write!(
+        packet,
+        " {x} {y} {epoch} {revision} {root_id} {root_lifetime} \
+        {g0} {g1} {g2} {g3} {g4} {g5} {hit_id} {hit_lifetime} {b0} {b1} {b2} {b3} {popup} {xid}",
+        x = point.0,
+        y = point.1,
+        epoch = proof.epoch,
+        revision = proof.tree_revision,
+        root_id = row.surface_id,
+        root_lifetime = row.lifetime,
+        g0 = g[0],
+        g1 = g[1],
+        g2 = g[2],
+        g3 = g[3],
+        g4 = g[4],
+        g5 = g[5],
+        hit_id = hit.surface_id,
+        hit_lifetime = hit.lifetime,
+        b0 = b[0],
+        b1 = b[1],
+        b2 = b[2],
+        b3 = b[3],
+        popup = u8::from(hit.popup),
+        xid = proof.xid.unwrap_or(0)
+    )
+    .expect("writing to String cannot fail");
+}
 
 pub(crate) fn execute_foreground(
     owner: Option<String>,
@@ -988,6 +1873,126 @@ pub(crate) fn execute_foreground_with_started(
         started,
         cancellation,
         DeliveryRoute::Foreground,
+    )
+}
+
+pub(crate) fn execute_xwayland_foreground(
+    owner: Option<String>,
+    pid: u32,
+    address: u64,
+    xid: u32,
+    action: Action,
+    cancellation: ActionCancellation,
+) -> Result<Value> {
+    execute_xwayland_foreground_with_started(owner, pid, address, xid, action, None, cancellation)
+}
+
+pub(crate) fn execute_xwayland_foreground_with_started(
+    owner: Option<String>,
+    pid: u32,
+    address: u64,
+    xid: u32,
+    action: Action,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+    cancellation: ActionCancellation,
+) -> Result<Value> {
+    ensure!(
+        xid != 0 && pid != 0 && address != 0 && protocol() == InputProtocol::Production,
+        "exact XWayland foreground target required"
+    );
+    ensure!(
+        matches!(action.capability(), 1 | 2 | 4 | 8)
+            && !matches!(
+                &action,
+                Action::Frame { .. }
+                    | Action::WindowCapture { .. }
+                    | Action::XWaylandCaptureForeground { .. }
+                    | Action::XWaylandForeground { .. }
+                    | Action::Text { .. }
+            ),
+        "XWayland foreground supports only physical pointer, keyboard, scroll or drag"
+    );
+    // The plugin rechecks this XID against its live native window and holds the
+    // physical-input interlock across activation, dispatch, and drag phases.
+    execute_routed(
+        owner,
+        pid,
+        address,
+        Action::XWaylandForeground {
+            xid,
+            action: Box::new(action),
+        },
+        started,
+        cancellation,
+        DeliveryRoute::Foreground,
+    )
+}
+
+/// Bind the exported XWayland surface and XID before taking over the primary
+/// seat. This route never sends private-seat events or global XTest input.
+pub(crate) fn execute_xwayland_capture_foreground(
+    owner: Option<String>,
+    pid: u32,
+    address: u64,
+    action: Action,
+    point: (f64, f64),
+    proof: WindowCaptureProof,
+    cancellation: ActionCancellation,
+) -> Result<Value> {
+    ensure!(
+        protocol() == InputProtocol::Production && proof.xid.is_some(),
+        "captured XWayland input requires XID"
+    );
+    validate_capture_proof(&proof, pid, address, point)?;
+    let width = proof.root.root_geometry[2];
+    let height = proof.root.root_geometry[3];
+    let action = Action::XWaylandCaptureForeground {
+        point,
+        proof,
+        action: Box::new(action),
+    };
+    action.packet(1, "0123456789abcdef0123456789abcdef", 1, width, height)?;
+    execute_routed(
+        owner,
+        pid,
+        address,
+        action,
+        None,
+        cancellation,
+        DeliveryRoute::Foreground,
+    )
+}
+
+pub(crate) fn execute_xwayland_foreground_text(
+    owner: Option<String>,
+    pid: u32,
+    address: u64,
+    xid: u32,
+    text: &str,
+    cancellation: ActionCancellation,
+) -> Result<Value> {
+    ensure!(
+        xid != 0 && protocol() == InputProtocol::Production,
+        "exact XWayland foreground target required"
+    );
+    let actions = text_actions(text)?;
+    ensure!(!actions.is_empty(), "foreground text must not be empty");
+    let actions = actions
+        .into_iter()
+        .map(|action| Action::XWaylandForeground {
+            xid,
+            action: Box::new(action),
+        })
+        .collect();
+    execute_actions_routed(
+        owner,
+        pid,
+        address,
+        actions,
+        None,
+        cancellation,
+        DeliveryRoute::Foreground,
+        true,
     )
 }
 
@@ -1098,6 +2103,28 @@ fn execute_actions_routed(
             return Ok(json!({"ok":false,"code":reason,"detail":reason}));
         }
     }
+    with_claimed_client(owner, pid, address, cancellation, route, |slot| {
+        dispatch_actions_in_slot(slot, actions, started, route, text, Client::attest)
+    })
+}
+
+fn with_claimed_client(
+    owner: String,
+    pid: u32,
+    address: u64,
+    cancellation: ActionCancellation,
+    route: DeliveryRoute,
+    dispatch: impl FnOnce(&mut Option<Client>) -> Result<Value>,
+) -> Result<Value> {
+    cancellation.check()?;
+    ensure!(
+        enabled() && pid != 0 && address != 0,
+        "exact input target unavailable"
+    );
+    ensure!(
+        protocol() == InputProtocol::Production || route == DeliveryRoute::Background,
+        "foreground input requires production protocol"
+    );
     let client = session_client(&owner)?;
     let mut slot = client.lock(&cancellation)?;
     if let Some(client) = slot.as_ref() {
@@ -1126,7 +2153,601 @@ fn execute_actions_routed(
     slot.as_mut()
         .context("missing input connection")?
         .cancellation = cancellation;
-    dispatch_actions_in_slot(&mut slot, actions, started, route, text, Client::attest)
+    dispatch(&mut slot)
+}
+
+fn hex_text(text: &str) -> Result<String> {
+    ensure!(
+        !text.is_empty() && text.len() <= 900 && !text.contains('\0'),
+        "text must contain 1–900 UTF-8 bytes without NUL"
+    );
+    let mut hex = String::with_capacity(text.len() * 2);
+    use std::fmt::Write as _;
+    for byte in text.bytes() {
+        write!(&mut hex, "{byte:02x}")?;
+    }
+    Ok(hex)
+}
+
+fn one_time_target(client: &mut Client, command: &str) -> Result<Value> {
+    client.cancellation.check()?;
+    ensure!(
+        client.lane.is_some() && client.protocol == InputProtocol::Production,
+        "production input lane required"
+    );
+    client.attest()?;
+    client.delivery_route = Some(DeliveryRoute::Background);
+    client.request(command)
+}
+
+fn action_request(client: &Client, packet: &str, acknowledged_phases: u32) -> Result<Value> {
+    let deadline = Instant::now() + TIMEOUT;
+    client.send_packet(packet, deadline).map_err(|error| {
+        if error.is::<ActionCancelled>() {
+            error
+        } else {
+            unknown_dispatch(error, acknowledged_phases)
+        }
+    })?;
+    client
+        .receive(deadline)
+        .map_err(|error| unknown_dispatch(error, acknowledged_phases))
+}
+
+/// Hold the claimed compositor lane and exact one-use semantic grant for the
+/// whole target-bound accessibility operation. A failure retires the socket.
+pub(crate) fn with_semantic_target(
+    owner: Option<String>,
+    pid: u32,
+    address: u64,
+    cancellation: ActionCancellation,
+    operation: impl FnOnce() -> Result<Value>,
+) -> Result<Value> {
+    ensure!(
+        protocol() == InputProtocol::Production,
+        "semantic guard requires production input"
+    );
+    let owner = owner.context("authenticated lifecycle required")?;
+    with_claimed_client(
+        owner,
+        pid,
+        address,
+        cancellation,
+        DeliveryRoute::Background,
+        |slot| {
+            dispatch_in_slot(
+                slot,
+                |_| Ok(()),
+                |client| {
+                    let target =
+                        one_time_target(client, &format!("SEMANTIC_TARGET {pid} {address:x} 256"))?;
+                    if target["ok"] == false {
+                        return Err(SemanticTargetUnavailable(
+                            target["code"]
+                                .as_str()
+                                .context("missing semantic refusal code")?
+                                .to_owned(),
+                        )
+                        .into());
+                    }
+                    let token = hex_field(&target, "target")?;
+                    let revision = target["revision"]
+                        .as_u64()
+                        .context("missing semantic target revision")?;
+                    client.cancellation.check()?;
+                    let result = operation()?;
+                    client.sequence = client
+                        .sequence
+                        .checked_add(1)
+                        .context("sequence exhausted")?;
+                    let done = action_request(
+                        client,
+                        &format!("SEMANTIC_DONE {} {token} {revision}", client.sequence),
+                        0,
+                    )
+                    .map_err(|error| {
+                        if error.is::<ActionCancelled>() {
+                            unknown_dispatch(error, 0)
+                        } else {
+                            error
+                        }
+                    })?;
+                    if done["ok"] != true
+                        || done["effect"] != "unverifiable"
+                        || done["route"] != "semantic_target_guard"
+                    {
+                        return Err(unknown_dispatch(
+                            anyhow::anyhow!("semantic completion was not acknowledged: {done}"),
+                            0,
+                        ));
+                    }
+                    Ok(result)
+                },
+            )
+        },
+    )
+}
+
+/// Commit/preedit are seat text-input operations, not physical keys or a
+/// clipboard substitute. Cursor offsets name UTF-8 byte boundaries.
+pub(crate) fn execute_preedit(
+    owner: Option<String>,
+    pid: u32,
+    address: u64,
+    text: &str,
+    cursor_begin: i32,
+    cursor_end: i32,
+    cancellation: ActionCancellation,
+) -> Result<Value> {
+    let cursor_boundary = |cursor: i32| {
+        cursor == -1 || usize::try_from(cursor).is_ok_and(|n| text.is_char_boundary(n))
+    };
+    ensure!(
+        text.len() <= 900
+            && !text.contains('\0')
+            && cursor_boundary(cursor_begin)
+            && cursor_boundary(cursor_end),
+        "preedit exceeds bounded UTF-8 text or cursor boundaries"
+    );
+    let hex = if text.is_empty() {
+        "-".to_owned()
+    } else {
+        hex_text(text)?
+    };
+    execute_semantic_text_packet(
+        owner,
+        pid,
+        address,
+        move |sequence, token, revision| {
+            format!("TEXT_PREEDIT {sequence} {token} {revision} {hex} {cursor_begin} {cursor_end}")
+        },
+        cancellation,
+    )
+}
+
+pub(crate) fn execute_semantic_text_commit(
+    owner: Option<String>,
+    pid: u32,
+    address: u64,
+    text: &str,
+    cancellation: ActionCancellation,
+) -> Result<Value> {
+    let hex = hex_text(text)?;
+    execute_semantic_text_packet(
+        owner,
+        pid,
+        address,
+        move |sequence, token, revision| format!("TEXT_COMMIT {sequence} {token} {revision} {hex}"),
+        cancellation,
+    )
+}
+
+fn execute_semantic_text_packet(
+    owner: Option<String>,
+    pid: u32,
+    address: u64,
+    packet: impl FnOnce(u64, &str, u64) -> String,
+    cancellation: ActionCancellation,
+) -> Result<Value> {
+    ensure!(
+        protocol() == InputProtocol::Production,
+        "seat text-input requires production input"
+    );
+    let owner = owner.context("authenticated lifecycle required")?;
+    if let Err(reason) = super::hyprland_compatibility::qualify(pid) {
+        return Ok(json!({"ok":false,"code":reason,"detail":reason}));
+    }
+    with_claimed_client(
+        owner,
+        pid,
+        address,
+        cancellation,
+        DeliveryRoute::Background,
+        |slot| {
+            dispatch_in_slot(
+                slot,
+                |_| Ok(()),
+                |client| {
+                    let target =
+                        one_time_target(client, &format!("SEMANTIC_TARGET {pid} {address:x} 256"))?;
+                    if target["ok"] == false {
+                        return Ok(target);
+                    }
+                    let token = hex_field(&target, "target")?;
+                    let revision = target["revision"]
+                        .as_u64()
+                        .context("missing text target revision")?;
+                    if let Some(refusal) = client.await_text_input(&token, revision)? {
+                        return Ok(refusal);
+                    }
+                    client.sequence = client
+                        .sequence
+                        .checked_add(1)
+                        .context("sequence exhausted")?;
+                    let reply =
+                        action_request(client, &packet(client.sequence, &token, revision), 0)?;
+                    if reply["ok"] == true
+                        && (reply["effect"] != "unverifiable"
+                            || reply["route"] != "seat_text_input")
+                    {
+                        return Err(unknown_dispatch(
+                            anyhow::anyhow!("invalid seat text-input acknowledgement"),
+                            0,
+                        ));
+                    }
+                    Ok(reply)
+                },
+            )
+        },
+    )
+}
+
+pub(crate) fn execute_selection(
+    owner: String,
+    pid: u32,
+    address: u64,
+    text: &str,
+    cancellation: ActionCancellation,
+) -> Result<Value> {
+    ensure!(
+        protocol() == InputProtocol::Production,
+        "private selection requires production input"
+    );
+    let hex = hex_text(text)?;
+    if let Err(reason) = super::hyprland_compatibility::qualify(pid) {
+        return Ok(json!({"ok":false,"code":reason,"detail":reason}));
+    }
+    with_claimed_client(
+        owner,
+        pid,
+        address,
+        cancellation,
+        DeliveryRoute::Background,
+        |slot| {
+            dispatch_in_slot(
+                slot,
+                |_| Ok(()),
+                |client| {
+                    let target = one_time_target(
+                        client,
+                        &format!("SELECTION_TARGET {pid} {address:x} 128"),
+                    )?;
+                    if target["ok"] == false {
+                        return Ok(target);
+                    }
+                    let token = hex_field(&target, "target")?;
+                    let revision = target["revision"]
+                        .as_u64()
+                        .context("missing selection revision")?;
+                    client.sequence = client
+                        .sequence
+                        .checked_add(1)
+                        .context("sequence exhausted")?;
+                    let reply = action_request(
+                        client,
+                        &format!("SET_SELECTION {} {token} {revision} {hex}", client.sequence),
+                        0,
+                    )?;
+                    if reply["ok"] == true {
+                        if reply["selection_owned"] != true
+                            || reply["offered_to_target"] != true
+                            || !reply["expires_in_ms"]
+                                .as_u64()
+                                .is_some_and(|ttl| ttl > 0 && ttl <= 60_000)
+                        {
+                            return Err(unknown_dispatch(
+                                anyhow::anyhow!("selection ownership not confirmed"),
+                                0,
+                            ));
+                        }
+                    }
+                    Ok(reply)
+                },
+            )
+        },
+    )
+}
+
+pub(crate) fn clear_selection(owner: String, cancellation: ActionCancellation) -> Result<Value> {
+    cancellation.check()?;
+    ensure!(
+        protocol() == InputProtocol::Production,
+        "private selection requires production input"
+    );
+    let session = session_client(&owner)?;
+    let mut slot = session.lock(&cancellation)?;
+    let Some(client) = slot.as_mut() else {
+        return Ok(json!({"ok":true,"cleared":false}));
+    };
+    client.cancellation = cancellation;
+    dispatch_in_slot(&mut slot, Client::attest, |client| {
+        let reply = action_request(client, "CLEAR_SELECTION", 0)?;
+        if reply["ok"] == true {
+            if reply["cleared"].as_bool().is_none() {
+                return Err(unknown_dispatch(
+                    anyhow::anyhow!("missing selection clear acknowledgement"),
+                    0,
+                ));
+            }
+        }
+        Ok(reply)
+    })
+}
+
+/// Primary-seat cross-window transfer is separately authorized and never
+/// represented as an isolated-seat data offer.
+pub(crate) fn execute_foreground_transfer(
+    owner: Option<String>,
+    source_pid: u32,
+    source_address: u64,
+    dest_pid: u32,
+    dest_address: u64,
+    source_local: (f64, f64),
+    dest_local: (f64, f64),
+    source_proof: WindowCaptureProof,
+    dest_proof: WindowCaptureProof,
+    duration_ms: u64,
+    cancellation: ActionCancellation,
+) -> Result<Value> {
+    execute_transfer_routed(
+        owner,
+        source_pid,
+        source_address,
+        dest_pid,
+        dest_address,
+        source_local,
+        dest_local,
+        source_proof,
+        dest_proof,
+        duration_ms,
+        cancellation,
+        DeliveryRoute::Foreground,
+    )
+}
+
+/// Native agent-seat transfer is bound to both independently authorized
+/// compositor windows. Mouse motion alone is not data delivery.
+pub(crate) fn execute_transfer(
+    owner: Option<String>,
+    source_pid: u32,
+    source_address: u64,
+    dest_pid: u32,
+    dest_address: u64,
+    source_local: (f64, f64),
+    dest_local: (f64, f64),
+    source_proof: WindowCaptureProof,
+    dest_proof: WindowCaptureProof,
+    duration_ms: u64,
+    cancellation: ActionCancellation,
+) -> Result<Value> {
+    execute_transfer_routed(
+        owner,
+        source_pid,
+        source_address,
+        dest_pid,
+        dest_address,
+        source_local,
+        dest_local,
+        source_proof,
+        dest_proof,
+        duration_ms,
+        cancellation,
+        DeliveryRoute::Background,
+    )
+}
+
+fn execute_transfer_routed(
+    owner: Option<String>,
+    source_pid: u32,
+    source_address: u64,
+    dest_pid: u32,
+    dest_address: u64,
+    source_local: (f64, f64),
+    dest_local: (f64, f64),
+    source_proof: WindowCaptureProof,
+    dest_proof: WindowCaptureProof,
+    duration_ms: u64,
+    cancellation: ActionCancellation,
+    route: DeliveryRoute,
+) -> Result<Value> {
+    ensure!(
+        protocol() == InputProtocol::Production,
+        "cross-window DnD requires production input"
+    );
+    ensure!(
+        source_pid != 0
+            && source_address != 0
+            && dest_pid != 0
+            && dest_address != 0
+            && (source_pid, source_address) != (dest_pid, dest_address)
+            && (100..=2000).contains(&duration_ms)
+            && [source_local.0, source_local.1, dest_local.0, dest_local.1]
+                .iter()
+                .all(|v| v.is_finite()),
+        "invalid dual-target transfer"
+    );
+    validate_capture_proof(&source_proof, source_pid, source_address, source_local)?;
+    validate_capture_proof(&dest_proof, dest_pid, dest_address, dest_local)?;
+    ensure!(
+        source_proof.epoch == dest_proof.epoch
+            && source_proof.tree_revision == dest_proof.tree_revision,
+        "dual-target capture scene changed"
+    );
+    ensure!(
+        route != DeliveryRoute::Background
+            || (source_proof.xid.is_none() && dest_proof.xid.is_none()),
+        "background DnD requires two native surfaces"
+    );
+    if route == DeliveryRoute::Background {
+        for pid in [source_pid, dest_pid] {
+            if let Err(reason) = super::hyprland_compatibility::qualify(pid) {
+                return Ok(json!({"ok":false,"code":reason,"detail":reason}));
+            }
+        }
+    }
+    let owner = owner.context("authenticated lifecycle required")?;
+    with_claimed_client(
+        owner,
+        source_pid,
+        source_address,
+        cancellation,
+        route,
+        |slot| {
+            dispatch_in_slot(slot, Client::attest, |client| {
+                client.check_route(route)?;
+                let target_command = if route == DeliveryRoute::Foreground {
+                    "FOREGROUND_DND_CAPTURE_TARGET"
+                } else {
+                    "DND_CAPTURE_TARGET"
+                };
+                client.delivery_route = Some(route);
+                let mut target_packet = format!(
+                "{target_command} {source_pid} {source_address:x} {dest_pid} {dest_address:x} 64");
+                append_capture_endpoint(&mut target_packet, &source_proof, source_local);
+                append_capture_endpoint(&mut target_packet, &dest_proof, dest_local);
+                ensure!(
+                    target_packet.len() <= MAX_PACKET,
+                    "captured transfer target too large"
+                );
+                let target = client.request(&target_packet)?;
+                if target["ok"] == true {
+                    if route == DeliveryRoute::Foreground {
+                        validate_target_route(&target, route)?;
+                    } else {
+                        ensure!(
+                            target["route"] == "native_data_device",
+                            "native transfer target route mismatch"
+                        );
+                    }
+                }
+                if target["ok"] == false {
+                    let mut refusal = target;
+                    refusal["effect"] = json!("refused");
+                    return Ok(refusal);
+                }
+                let token = hex_field(&target, "target")?;
+                let source_revision = target["source_revision"]
+                    .as_u64()
+                    .context("missing source revision")?;
+                let dest_revision = target["dest_revision"]
+                    .as_u64()
+                    .context("missing destination revision")?;
+                for (point, width, height) in [
+                    (source_local, "source_width", "source_height"),
+                    (dest_local, "dest_width", "dest_height"),
+                ] {
+                    let w = target[width].as_f64().context("missing transfer width")?;
+                    let h = target[height].as_f64().context("missing transfer height")?;
+                    ensure!(
+                        w.is_finite()
+                            && h.is_finite()
+                            && w > 0.0
+                            && h > 0.0
+                            && point.0 >= 0.0
+                            && point.1 >= 0.0
+                            && point.0 < w
+                            && point.1 < h,
+                        "transfer point outside exact target"
+                    );
+                }
+                client.sequence = client
+                    .sequence
+                    .checked_add(1)
+                    .context("sequence exhausted")?;
+                let deadline = Instant::now() + TIMEOUT;
+                let command = if route == DeliveryRoute::Foreground {
+                    "FOREGROUND_DND"
+                } else {
+                    "DND"
+                };
+                let packet = format!("{command} {} {token} {source_revision} {dest_revision} {} {} {} {} {duration_ms}",
+                client.sequence, source_local.0, source_local.1, dest_local.0, dest_local.1);
+                client.send_packet(&packet, deadline).map_err(|error| {
+                    if error.is::<ActionCancelled>() {
+                        error
+                    } else {
+                        unknown_dispatch(error, 0)
+                    }
+                })?;
+                let first = client
+                    .receive(deadline)
+                    .map_err(|error| unknown_dispatch(error, 0))?;
+                if first["ok"] == false {
+                    if first["code"] == "foreground_partial_unknown" || first["effect"] == "unknown"
+                    {
+                        return Err(unknown_dispatch(
+                            anyhow::anyhow!("transfer press may have been delivered: {first}"),
+                            u32::from(first["press_delivered"] == true),
+                        ));
+                    }
+                    let mut refusal = first;
+                    refusal["effect"] = json!(if refusal["press_delivered"] == true {
+                        "partial"
+                    } else {
+                        "refused"
+                    });
+                    return Ok(refusal);
+                }
+                if first["phase"] != "started" || first["press_delivered"] != true {
+                    return Err(unknown_dispatch(
+                        anyhow::anyhow!("invalid transfer start acknowledgement"),
+                        0,
+                    ));
+                }
+                let mut reply = client
+                    .receive(Instant::now() + Duration::from_millis(duration_ms + 3000))
+                    .map_err(|error| unknown_dispatch(error, 1))?;
+                reply["press_delivered"] = json!(true);
+                if reply["code"] == "foreground_partial_unknown" || reply["effect"] == "unknown" {
+                    return Err(unknown_dispatch(
+                        anyhow::anyhow!("transfer outcome after press is unknown: {reply}"),
+                        1,
+                    ));
+                }
+                if reply["ok"] == false {
+                    reply["effect"] = json!("partial");
+                    return Ok(reply);
+                }
+                if route == DeliveryRoute::Foreground {
+                    if reply["effect"] != "unverifiable"
+                        || reply["route"] != "primary_foreground_data_device"
+                        || reply["source_started"] != true
+                        || reply["drop_dispatched"] != true
+                        || reply["motion_delivered"].as_bool().is_none()
+                        || reply["release_delivered"].as_bool().is_none()
+                    {
+                        return Err(unknown_dispatch(
+                            anyhow::anyhow!("foreground transfer delivery is not attested"),
+                            1,
+                        ));
+                    }
+                } else {
+                    let fields = [
+                        "source_started",
+                        "offered",
+                        "accepted",
+                        "receive_requested",
+                        "drop_performed",
+                        "finished",
+                    ];
+                    if reply["effect"] != "unverifiable"
+                        || reply["route"] != "native_data_device"
+                        || !fields.iter().all(|key| reply[*key].as_bool().is_some())
+                        || !reply["chosen_action"].is_number()
+                        || !reply["accepted_mime"].is_string()
+                    {
+                        return Err(unknown_dispatch(
+                            anyhow::anyhow!(
+                                "native transfer result lacks actual data-device outcome"
+                            ),
+                            1,
+                        ));
+                    }
+                }
+                Ok(reply)
+            })
+        },
+    )
 }
 
 fn dispatch_actions_in_slot(
@@ -1243,6 +2864,7 @@ fn terminal_connection_result(value: &Value) -> bool {
                         | "plugin_shutdown"
                         | "generation_exhausted"
                         | "text_interrupted"
+                        | "text_input_unavailable"
                 )
             ))
 }
@@ -1316,7 +2938,13 @@ mod tests {
         route: DeliveryRoute,
     ) -> Result<Value> {
         let mut started = started;
-        client.dispatch_routed_with_started(packet, is_drag, &mut started, route)
+        client.dispatch_routed_with_started(
+            packet,
+            is_drag,
+            &mut started,
+            route,
+            route.acknowledgement(),
+        )
     }
 
     fn dispatch_production_key(slot: &mut Option<Client>, route: DeliveryRoute) -> Result<Value> {

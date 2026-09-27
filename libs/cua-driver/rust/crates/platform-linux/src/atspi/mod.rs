@@ -474,6 +474,72 @@ pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
     }
     native::type_into_editable_at(pid, idx, text)
 }
+/// An exact semantic target could not be proven before any editable write.
+#[derive(Debug)]
+pub struct SemanticTargetUnavailable(pub String);
+
+impl std::fmt::Display for SemanticTargetUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SemanticTargetUnavailable {}
+
+fn semantic_target_unavailable(message: impl Into<String>) -> anyhow::Error {
+    SemanticTargetUnavailable(message.into()).into()
+}
+
+/// Insert Unicode into the exact editable observed in a window-scoped snapshot.
+///
+/// Unlike the pid-wide helper, this never chooses another field, moves keyboard
+/// focus, replaces the whole value, or synthesizes key events on failure. A
+/// missing/stale snapshot is a refusal; an unanswered write has unknown delivery
+/// and must not be retried by the caller.
+pub fn type_into_editable_in(
+    pid: u32,
+    xid: u64,
+    idx: usize,
+    expected: &AtspiIdentity,
+    text: &str,
+) -> Result<()> {
+    if xid == 0 {
+        return Err(semantic_target_unavailable(
+            "an exact window_id is required for semantic text",
+        ));
+    }
+    let element = cache::cached_element(pid, Some(xid), idx).ok_or_else(|| {
+        semantic_target_unavailable(format!(
+            "no window-scoped AT-SPI snapshot for element {idx}"
+        ))
+    })?;
+    if element.identity != *expected {
+        return Err(semantic_target_unavailable(format!(
+            "semantic text snapshot was superseded for element {idx}"
+        )));
+    }
+    let object = element.object_ref.ok_or_else(|| {
+        semantic_target_unavailable(format!("element {idx} has no proven AT-SPI object"))
+    })?;
+    if object.bus != element.identity.bus_name || object.path != element.identity.path {
+        return Err(semantic_target_unavailable(format!(
+            "element {idx} changed AT-SPI identity"
+        )));
+    }
+    if !element.identity.frame_bus_name.starts_with(':') || !object.bus.starts_with(':') {
+        return Err(semantic_target_unavailable(format!(
+            "element {idx} has no unique D-Bus owner"
+        )));
+    }
+    native::insert_text_bound_ref(
+        &object,
+        &native::ObjectRef {
+            bus: element.identity.frame_bus_name,
+            path: element.identity.frame_path,
+        },
+        text,
+    )
+}
 
 /// Set the text value of element `idx` within pid's app tree via AT-SPI.
 /// Tries `EditableText.set_text_contents(value)` first, then
@@ -828,5 +894,75 @@ mod budget_tests {
         assert!(!result.truncated);
         assert_eq!(result.nodes_visited, 0);
         assert!(result.bounds_complete);
+    }
+}
+
+#[cfg(test)]
+mod semantic_text_target_tests {
+    use super::*;
+
+    #[test]
+    fn exact_window_and_object_identity_refuse_before_any_bus_write() {
+        let pid = u32::MAX - 41;
+        let window = u64::MAX - 41;
+        let mut node = AtspiNode {
+            element_index: Some(7),
+            role: "text".into(),
+            name: None,
+            value: None,
+            checked: None,
+            enabled: Some(true),
+            selected: None,
+            description: None,
+            actions: Vec::new(),
+            element_key: 7,
+            identity: Some(AtspiIdentity {
+                bus_name: ":1.11".into(),
+                path: "/field".into(),
+                frame_bus_name: ":1.11".into(),
+                frame_path: "/frame".into(),
+            }),
+            depth: 0,
+            parent_element_index: None,
+            in_web_content: false,
+            object_ref: Some(native::ObjectRef {
+                bus: ":1.12".into(),
+                path: "/field".into(),
+            }),
+        };
+        cache::update_snapshot(pid, window, std::slice::from_ref(&node), &[]);
+        let wrong_window =
+            type_into_editable_in(pid, window - 1, 7, node.identity.as_ref().unwrap(), "漢🙂")
+                .unwrap_err();
+        assert!(wrong_window.is::<SemanticTargetUnavailable>());
+        assert!(wrong_window
+            .to_string()
+            .contains("window-scoped AT-SPI snapshot"));
+        let wrong_pid =
+            type_into_editable_in(pid - 1, window, 7, node.identity.as_ref().unwrap(), "漢🙂")
+                .unwrap_err()
+                .to_string();
+        assert!(wrong_pid.contains("window-scoped AT-SPI snapshot"));
+        let wrong_object =
+            type_into_editable_in(pid, window, 7, node.identity.as_ref().unwrap(), "漢🙂")
+                .unwrap_err()
+                .to_string();
+        assert!(wrong_object.contains("changed AT-SPI identity"));
+        let original = node.identity.clone().unwrap();
+        node.identity.as_mut().unwrap().path = "/replacement-field".into();
+        cache::update_snapshot(pid, window, std::slice::from_ref(&node), &[]);
+        assert!(type_into_editable_in(pid, window, 7, &original, "漢🙂")
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot was superseded"));
+        node.object_ref = None;
+        cache::update_snapshot(pid, window, std::slice::from_ref(&node), &[]);
+        assert!(
+            type_into_editable_in(pid, window, 7, node.identity.as_ref().unwrap(), "漢🙂")
+                .unwrap_err()
+                .to_string()
+                .contains("no proven AT-SPI object")
+        );
+        cache::forget_window(pid, window);
     }
 }

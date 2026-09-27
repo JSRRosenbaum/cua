@@ -400,7 +400,8 @@ export enum ActionRoute {
     GlobalInput,
     SystemApi,
     Dom,
-    TrustedInput
+    TrustedInput,
+    DataTransfer
 }
 
 const FfiConverterTypeActionRoute = (() => {
@@ -415,6 +416,7 @@ const FfiConverterTypeActionRoute = (() => {
                 case 4: return ActionRoute.SystemApi;
                 case 5: return ActionRoute.Dom;
                 case 6: return ActionRoute.TrustedInput;
+                case 7: return ActionRoute.DataTransfer;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -426,6 +428,7 @@ const FfiConverterTypeActionRoute = (() => {
                 case ActionRoute.SystemApi: return ordinalConverter.write(4, into);
                 case ActionRoute.Dom: return ordinalConverter.write(5, into);
                 case ActionRoute.TrustedInput: return ordinalConverter.write(6, into);
+                case ActionRoute.DataTransfer: return ordinalConverter.write(7, into);
             }
         }
         allocationSize(value: TypeName): number {
@@ -1266,7 +1269,15 @@ export type ClipboardWriteOutput = {
     writtenType: string,
     types: Array<string>,
     privacySensitive: boolean,
-    contentRedactedFromTelemetry: boolean
+    contentRedactedFromTelemetry: boolean,
+    /**
+     * Explicit write to the desktop-wide selection, not an agent-private one.
+     */
+    selectionScope: string,
+    /**
+     * Null if the platform does not expose process-owned selection offers.
+     */
+    selectionOwner?: string
 }
 
 /**
@@ -1294,7 +1305,9 @@ const FfiConverterTypeClipboardWriteOutput = (() => {
                 writtenType: FfiConverterString.read(from),
                 types: FfiConverterSequenceString.read(from),
                 privacySensitive: FfiConverterBool.read(from),
-                contentRedactedFromTelemetry: FfiConverterBool.read(from)
+                contentRedactedFromTelemetry: FfiConverterBool.read(from),
+                selectionScope: FfiConverterString.read(from),
+                selectionOwner: FfiConverterOptionalString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -1303,13 +1316,17 @@ const FfiConverterTypeClipboardWriteOutput = (() => {
             FfiConverterSequenceString.write(value.types, into);
             FfiConverterBool.write(value.privacySensitive, into);
             FfiConverterBool.write(value.contentRedactedFromTelemetry, into);
+            FfiConverterString.write(value.selectionScope, into);
+            FfiConverterOptionalString.write(value.selectionOwner, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterBool.allocationSize(value.supported) +
              FfiConverterString.allocationSize(value.writtenType) +
              FfiConverterSequenceString.allocationSize(value.types) +
              FfiConverterBool.allocationSize(value.privacySensitive) +
-             FfiConverterBool.allocationSize(value.contentRedactedFromTelemetry);
+             FfiConverterBool.allocationSize(value.contentRedactedFromTelemetry) +
+             FfiConverterString.allocationSize(value.selectionScope) +
+             FfiConverterOptionalString.allocationSize(value.selectionOwner);
 
         }
     };

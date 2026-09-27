@@ -237,7 +237,13 @@ pub fn classify_cursor_semantics(name: &str, args: &Value) -> Option<CursorSeman
         "launch_app" | "activate_app" | "bring_to_front" | "set_window_frame" | "invoke_menu"
         | "list_apps" | "list_windows" | "kill_app" => CursorAction::App,
 
-        "upload_file" | "download_file" | "copy_file" | "move_file" => CursorAction::Transfer,
+        "transfer_data"
+        | "set_agent_selection"
+        | "clear_agent_selection"
+        | "upload_file"
+        | "download_file"
+        | "copy_file"
+        | "move_file" => CursorAction::Transfer,
 
         "start_recording" | "stop_recording" | "get_recording_state" | "replay_trajectory" => {
             CursorAction::Record

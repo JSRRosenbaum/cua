@@ -38,12 +38,13 @@ src/primary_trace.cpp
 src/primary_trace.hpp
 src/protocol.cpp
 src/seat_lifetime.hpp
+src/seat_selection.cpp
+src/seat_selection.hpp
+src/seat_selection_payload.hpp
 src/session.cpp
 src/status.cpp
 tests/cmake-api/CMakeLists.txt
 tests/cmake-api/include/src/plugins/PluginAPI.hpp
-tests/desktop_fault_policy_fixture.cpp
-tests/desktop_fault_policy_test.py
 tests/drag_geometry_test.cpp
 tests/foreground_route_test.cpp
 tests/input_grant_test.cpp
@@ -57,6 +58,7 @@ tests/plugin_api_test.cpp
 tests/plugin_input_lifetime_test.cpp
 tests/protocol_test.cpp
 tests/seat_lifetime_test.cpp
+tests/seat_selection_payload_test.cpp
 tests/status_test.cpp
 tests/transport_test.cpp
 """.split()

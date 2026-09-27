@@ -16,6 +16,20 @@ hyprland_foreground_test::foreground_action_refused_while_independent_virtual_po
 hyprland_foreground_test::foreground_drag_focus_loss_does_not_release_into_successor | Manual native-Hyprland gate: needs a live Hyprland compositor with the Cua plugin; RFC 3550 drag focus-loss safety
 hyprland_foreground_test::foreground_drag_focus_loss_does_not_release_into_same_client_sibling | Manual native-Hyprland gate: needs a live Hyprland compositor with the Cua plugin; RFC 3550 drag focus-loss safety
 hyprland_native_observation_test::native_window_capture_and_background_ax_keep_exact_identity | Manual native-Hyprland gate: needs a live Hyprland compositor; exact-identity capture and owner-mismatch refusals
+hyprland_omarchy_acceptance_test::general_native_px_click_has_application_effect_and_continuous_primary_isolation | Manual Omarchy fork gate: disposable candidate compositor, explicit general-native mode and independent physical-seat sentinel
+hyprland_omarchy_acceptance_test::exact_unicode_text_changes_only_the_named_native_widget | Manual Omarchy fork gate: disposable candidate compositor and exact-target semantic Unicode route
+hyprland_omarchy_acceptance_test::owned_xpra_intra_x11_xdnd_reaches_real_destination_application | Manual Omarchy fork gate: private Xpra/X11 owned session and cross-client GTK XDND application-state oracle
+hyprland_omarchy_acceptance_test::native_cross_client_transfer_has_actual_destination_state | Manual Omarchy fork gate: disposable candidate seat-scoped wl_data_device transfer and GTK application-owned destination state
+hyprland_omarchy_acceptance_test::certified_mode_refuses_unqualified_native_without_side_effects | Manual Omarchy fork gate: certified-mode exact exclusion and continuous physical-seat refusal oracle
+hyprland_omarchy_acceptance_test::compositor_scene_revision_tracks_real_child_geometry_stack_and_input_region | Manual Omarchy fork gate: live wl_subsurface mutations and cross-binary compositor/plugin scene revision with stale capture refusal
+hyprland_omarchy_acceptance_test::primary_text_input_v1_activation_commit_deactivation_and_refocus | Manual Omarchy fork gate: real primary wl_seat text-input-v1 and input-method-v2 physical IME wire regression
+hyprland_omarchy_acceptance_test::primary_text_input_v3_enable_commit_disable_and_refocus | Manual Omarchy fork gate: real primary wl_seat text-input-v3 and input-method-v2 physical IME wire regression
+hyprland_omarchy_acceptance_test::agent_v3_blur_requires_fresh_enable_commit | Manual Omarchy fork gate: real synthetic wl_seat v3 focus invalidation, fresh client commit and physical-seat isolation
+hyprland_omarchy_acceptance_test::unavailable_agent_ime_children_are_inert_and_do_not_disconnect_physical_ime | Manual Omarchy fork gate: unavailable synthetic IME-v2 child resource pipeline cannot observe or disable primary IME
+hyprland_omarchy_acceptance_test::native_popup_requires_exact_captured_surface_and_fresh_revision | Manual Omarchy fork gate: real GTK popover inventory, stale tree-capture refusal, application button effect and primary-seat isolation
+hyprland_omarchy_acceptance_test::agent_keyboard_events_remain_target_scoped_and_release_disables_delivery | Manual Omarchy fork gate: real synthetic wl_keyboard target/sibling wire isolation and released/unmapped lifecycle
+hyprland_omarchy_acceptance_test::agent_preedit_is_cleared_on_driver_eof | Manual Omarchy fork gate: nonempty synthetic text-input-v3 preedit clears immediately on owner EOF without foreign seat effects
+hyprland_omarchy_acceptance_test::agent_selection_offer_survives_return_then_owner_eof_clears_it | Manual Omarchy fork gate: real named-agent wl_data_device Unicode offer, post-return Ctrl+V app paste, clear and owner EOF lifetime
 
 # Optional external-app suite: the canonical Windows image has no LibreOffice.
 harness_libreoffice_test::harness_lo_vcl_font_color_expand_opens_picker | Optional Windows suite that needs LibreOffice Writer installed; under review in the lane-3 prune (#4094)

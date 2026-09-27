@@ -26,7 +26,7 @@ fn synthetic_pointer_drop_detection_covers_gtk_vcl_and_qt() {
 }
 
 #[test]
-fn desktop_window_lines_expose_pid_and_window_id() {
+fn desktop_window_metadata_uses_screenshot_coordinates_with_negative_origin() {
     let windows = vec![crate::x11::WindowInfo {
         xid: 0x2e00003,
         pid: Some(4321),
@@ -39,13 +39,9 @@ fn desktop_window_lines_expose_pid_and_window_id() {
         width: 1920,
         height: 1053,
     }];
-    let text = desktop_window_lines(&windows, 1.0);
-    assert!(text.contains("pid=4321 window_id=48234499"));
-    assert!(text.contains("LibreOffice Calc"));
-    assert!(text.contains("app=libreoffice"));
-    assert!(text.contains("get_window_state(pid, window_id)"));
-    assert!(desktop_window_lines(&[], 1.0).contains("none"));
-    // A downsized desktop screenshot reports window rects in ITS pixels.
-    let scaled = desktop_window_lines(&windows, 1.5);
-    assert!(scaled.contains("1280x702 at (0,18)"), "{scaled}");
+    let native = desktop_window_lines(&windows, (1920, 1080), (1920, 1080), (0, 0));
+    assert!(native.contains("pid=4321 window_id=48234499"));
+    assert!(native.contains("1920x1053 at (0,27)"), "{native}");
+    let mapped = desktop_window_lines(&windows, (1280, 540), (2560, 1080), (-300, -100));
+    assert!(mapped.contains("960x527 at (150,64)"), "{mapped}");
 }

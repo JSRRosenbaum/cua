@@ -446,6 +446,11 @@ pub struct ClipboardWriteOutput {
     pub types: Vec<String>,
     pub privacy_sensitive: bool,
     pub content_redacted_from_telemetry: bool,
+    /// Explicit write to the desktop-wide selection, not an agent-private one.
+    pub selection_scope: String,
+    /// Null if the platform does not expose process-owned selection offers.
+    #[schemars(required, schema_with = "nullable_string_schema")]
+    pub selection_owner: Option<String>,
 }
 
 impl ToolOutput for ClipboardWriteOutput {
@@ -482,6 +487,7 @@ pub enum ActionRoute {
     SystemApi,
     Dom,
     TrustedInput,
+    DataTransfer,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
@@ -765,7 +771,8 @@ mod tests {
                 "global_input",
                 "system_api",
                 "dom",
-                "trusted_input"
+                "trusted_input",
+                "data_transfer"
             ])
         );
 

@@ -1295,6 +1295,8 @@ class ActionRoute(enum.Enum):
 
     TRUSTED_INPUT = 5
 
+    DATA_TRANSFER = 6
+
 
 
 class _UniffiFfiConverterTypeActionRoute(_UniffiConverterRustBuffer):
@@ -1313,6 +1315,8 @@ class _UniffiFfiConverterTypeActionRoute(_UniffiConverterRustBuffer):
             return ActionRoute.DOM
         if variant == 6:
             return ActionRoute.TRUSTED_INPUT
+        if variant == 7:
+            return ActionRoute.DATA_TRANSFER
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -1328,6 +1332,8 @@ class _UniffiFfiConverterTypeActionRoute(_UniffiConverterRustBuffer):
         if value == ActionRoute.DOM:
             return
         if value == ActionRoute.TRUSTED_INPUT:
+            return
+        if value == ActionRoute.DATA_TRANSFER:
             return
         raise ValueError(value)
 
@@ -1345,6 +1351,8 @@ class _UniffiFfiConverterTypeActionRoute(_UniffiConverterRustBuffer):
             buf.write_i32(5)
         if value == ActionRoute.TRUSTED_INPUT:
             buf.write_i32(6)
+        if value == ActionRoute.DATA_TRANSFER:
+            buf.write_i32(7)
 
 
 
@@ -2377,18 +2385,20 @@ class _UniffiFfiConverterTypeClipboardWriteInput(_UniffiConverterRustBuffer):
 
 @dataclass
 class ClipboardWriteOutput:
-    def __init__(self, *, supported:bool, written_type:str, types:typing.List[str], privacy_sensitive:bool, content_redacted_from_telemetry:bool):
+    def __init__(self, *, supported:bool, written_type:str, types:typing.List[str], privacy_sensitive:bool, content_redacted_from_telemetry:bool, selection_scope:str, selection_owner:typing.Optional[str]):
         self.supported = supported
         self.written_type = written_type
         self.types = types
         self.privacy_sensitive = privacy_sensitive
         self.content_redacted_from_telemetry = content_redacted_from_telemetry
+        self.selection_scope = selection_scope
+        self.selection_owner = selection_owner
 
 
 
 
     def __str__(self):
-        return "ClipboardWriteOutput(supported={}, written_type={}, types={}, privacy_sensitive={}, content_redacted_from_telemetry={})".format(self.supported, self.written_type, self.types, self.privacy_sensitive, self.content_redacted_from_telemetry)
+        return "ClipboardWriteOutput(supported={}, written_type={}, types={}, privacy_sensitive={}, content_redacted_from_telemetry={}, selection_scope={}, selection_owner={})".format(self.supported, self.written_type, self.types, self.privacy_sensitive, self.content_redacted_from_telemetry, self.selection_scope, self.selection_owner)
     def __eq__(self, other):
         if self.supported != other.supported:
             return False
@@ -2399,6 +2409,10 @@ class ClipboardWriteOutput:
         if self.privacy_sensitive != other.privacy_sensitive:
             return False
         if self.content_redacted_from_telemetry != other.content_redacted_from_telemetry:
+            return False
+        if self.selection_scope != other.selection_scope:
+            return False
+        if self.selection_owner != other.selection_owner:
             return False
         return True
 
@@ -2411,6 +2425,8 @@ class _UniffiFfiConverterTypeClipboardWriteOutput(_UniffiConverterRustBuffer):
             types=_UniffiFfiConverterSequenceString.read(buf),
             privacy_sensitive=_UniffiFfiConverterBoolean.read(buf),
             content_redacted_from_telemetry=_UniffiFfiConverterBoolean.read(buf),
+            selection_scope=_UniffiFfiConverterString.read(buf),
+            selection_owner=_UniffiFfiConverterOptionalString.read(buf),
         )
 
     @staticmethod
@@ -2420,6 +2436,8 @@ class _UniffiFfiConverterTypeClipboardWriteOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterSequenceString.check_lower(value.types)
         _UniffiFfiConverterBoolean.check_lower(value.privacy_sensitive)
         _UniffiFfiConverterBoolean.check_lower(value.content_redacted_from_telemetry)
+        _UniffiFfiConverterString.check_lower(value.selection_scope)
+        _UniffiFfiConverterOptionalString.check_lower(value.selection_owner)
 
     @staticmethod
     def write(value, buf):
@@ -2428,6 +2446,8 @@ class _UniffiFfiConverterTypeClipboardWriteOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterSequenceString.write(value.types, buf)
         _UniffiFfiConverterBoolean.write(value.privacy_sensitive, buf)
         _UniffiFfiConverterBoolean.write(value.content_redacted_from_telemetry, buf)
+        _UniffiFfiConverterString.write(value.selection_scope, buf)
+        _UniffiFfiConverterOptionalString.write(value.selection_owner, buf)
 
 @dataclass
 class CursorMotionOutput:

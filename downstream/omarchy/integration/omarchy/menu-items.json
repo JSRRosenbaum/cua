@@ -1,0 +1,7 @@
+{
+  "trigger.cua": {"icon": "󰚥", "label": "Cua Driver", "when": "omarchy-pkg-present cua-omarchy-integration"},
+  "trigger.cua.status": {"icon": "󰒆", "label": "Live Session Status", "action": "omarchy-launch-floating-terminal-with-presentation 'cua-omarchy status'"},
+  "trigger.cua.revoke-one": {"icon": "󰩺", "label": "Revoke Named Session", "action": "omarchy-launch-floating-terminal-with-presentation 'cua-omarchy revoke-one-prompt'"},
+  "trigger.cua.revoke-all": {"icon": "󰑓", "label": "Revoke All Service Sessions", "action": "omarchy-launch-floating-terminal-with-presentation 'cua-omarchy revoke-all-prompt'"},
+  "trigger.cua.disable-input": {"icon": "󰒲", "label": "Disable Native Input", "action": "omarchy-launch-floating-terminal-with-presentation 'cua-omarchy disable-input'"}
+}

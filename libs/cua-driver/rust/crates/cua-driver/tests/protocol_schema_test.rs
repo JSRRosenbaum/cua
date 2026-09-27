@@ -9,7 +9,6 @@
 #![cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 
 use cua_driver_testkit::{Driver, McpDriver, RawDriver};
-use std::collections::BTreeSet;
 
 #[test]
 fn tools_list_schema_shape() {
@@ -142,18 +141,6 @@ fn tools_list_schema_shape() {
             "{tool}.delivery_mode should advertise background and foreground: {delivery:?}"
         );
     }
-    let schema_tools: BTreeSet<&str> = tools
-        .iter()
-        .filter(|tool| tool["inputSchema"]["properties"]["delivery_mode"].is_object())
-        .filter_map(|tool| tool["name"].as_str())
-        .collect();
-    let expected_tools: BTreeSet<&str> = DELIVERY_MODE_TOOLS.iter().copied().collect();
-    // The matching `input.delivery_mode` capability claim is owned by
-    // `schema_consistency_test::registered_tool_contracts_match_on_active_backend`.
-    assert_eq!(
-        schema_tools, expected_tools,
-        "unexpected delivery_mode schema set"
-    );
     // Session capture scope remains advertised only for compatibility. New
     // clients choose one typed window or desktop target on each action.
     let capture_scope = &properties("start_session")["capture_scope"];

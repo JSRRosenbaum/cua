@@ -1,0 +1,42 @@
+# Local, source-identified Hyprland candidate. NEVER install into a live desktop.
+# Build/install into an empty DESTDIR first; this recipe packages those exact bytes.
+# shellcheck shell=bash disable=SC2034,SC2154
+pkgname=hyprland-cua
+pkgver=@COMPOSITOR_PKGVER@
+pkgrel=1
+pkgdesc='Hyprland 0.56.2 fork with seat-scoped Cua APIs (fresh-login only)'
+arch=('x86_64')
+url='https://github.com/hyprwm/Hyprland'
+license=('BSD-3-Clause')
+depends=(@COMPOSITOR_DEPENDS@ @ABI_DEPENDS@)
+makedepends=('python' 'binutils')
+conflicts=('hyprland')
+provides=('wayland-compositor' "hyprland=$pkgver-$pkgrel")
+options=('!strip' '!debug' '!lto')
+source=('candidate-compositor.tar.gz' 'PROFILE.json' 'profile_verify.py' 'HYPRLAND-LICENSE')
+sha256sums=('@STAGE_SHA256@' '@PROFILE_SHA256@' '@VERIFIER_SHA256@' '@HYPRLAND_LICENSE_SHA256@')
+
+check() {
+  python3 "$startdir/profile_verify.py" verify-stage --kit "$startdir" \
+    --extracted "$srcdir/candidate-compositor" || return 1
+  sha256sum "$startdir/candidate-compositor.tar.gz" > "$srcdir/checked-compositor.sha256"
+}
+
+package() {
+  env -u LD_PRELOAD -u FAKEROOTKEY -u FAKED_MODE \
+    python3 "$startdir/profile_verify.py" verify-stage --kit "$startdir" \
+      --extracted "$srcdir/candidate-compositor" || return 1
+  [[ -f "$srcdir/checked-compositor.sha256" ]] || {
+    printf 'error: staged compositor bytes have not passed ABI checks\n' >&2
+    return 1
+  }
+  sha256sum --check "$srcdir/checked-compositor.sha256" || return 1
+  install -d "$pkgdir/usr"
+  cp -a "$srcdir/candidate-compositor/usr/." "$pkgdir/usr/" || return 1
+  install -Dm644 "$startdir/HYPRLAND-LICENSE" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE" || return 1
+  install -Dm644 "$startdir/PROFILE.json" \
+    "$pkgdir/usr/share/hyprland-cua/PROFILE.json" || return 1
+  install -Dm644 "$startdir/profile_verify.py" \
+    "$pkgdir/usr/share/hyprland-cua/profile_verify.py"
+}

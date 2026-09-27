@@ -130,17 +130,23 @@ pub fn desktop_frame_for_window_supported() -> bool {
     cfg!(target_os = "linux")
 }
 
-/// Reject the delivery combination that cannot preserve background posture.
-/// Call this only after delivery aliases and typed targets have been normalized.
+/// Desktop input actions need explicit foreground consent. An omitted
+/// delivery_mode defaults to background, so absence must also be refused.
 pub fn enforce_delivery_target(tool_name: &str, args: &Value) -> Result<(), ToolResult> {
-    if tool_name != "click"
-        || args.get("scope").and_then(Value::as_str) != Some("desktop")
-        || args.get("delivery_mode").and_then(Value::as_str) != Some("background")
+    if !matches!(
+        tool_name,
+        "click" | "scroll" | "drag" | "type_text" | "press_key" | "hotkey"
+    ) || args.get("scope").and_then(Value::as_str) != Some("desktop")
+        || args.get("delivery_mode").and_then(Value::as_str) == Some("foreground")
     {
         return Ok(());
     }
 
-    let message = cua_driver_contract::ClickInput::DESKTOP_BACKGROUND_MESSAGE;
+    let message = if tool_name == "click" {
+        cua_driver_contract::ClickInput::DESKTOP_BACKGROUND_MESSAGE
+    } else {
+        "desktop input requires delivery_mode:\"foreground\"; background delivery is unavailable for desktop targets"
+    };
     Err(crate::delivery::background_unavailable_result(
         message,
         "background_unavailable",
@@ -234,25 +240,36 @@ mod tests {
     }
 
     #[test]
-    fn desktop_background_guard_is_click_specific() {
+    fn desktop_input_actions_require_explicit_foreground_delivery() {
         let desktop_background = json!({
             "scope": "desktop",
             "delivery_mode": "background"
         });
-        let refusal = enforce_delivery_target("click", &desktop_background).unwrap_err();
-        assert_eq!(refusal.is_error, Some(true));
-        assert_eq!(
-            refusal.structured_content,
-            Some(json!({
-                "code": "background_unavailable",
-                "effect": "refused",
-                "suggestion": "Retry this action with delivery_mode:\"foreground\".",
-                "escalation": {
-                    "recommended": "foreground",
-                    "reason": cua_driver_contract::ClickInput::DESKTOP_BACKGROUND_MESSAGE,
-                },
-            }))
-        );
+        for tool in [
+            "click",
+            "scroll",
+            "drag",
+            "type_text",
+            "press_key",
+            "hotkey",
+        ] {
+            let refusal = enforce_delivery_target(tool, &desktop_background).unwrap_err();
+            assert_eq!(refusal.is_error, Some(true));
+            assert_eq!(
+                refusal.structured_content.as_ref().unwrap()["code"],
+                "background_unavailable"
+            );
+        }
+        for tool in [
+            "click",
+            "scroll",
+            "drag",
+            "type_text",
+            "press_key",
+            "hotkey",
+        ] {
+            assert!(enforce_delivery_target(tool, &json!({"scope":"desktop"})).is_err());
+        }
 
         for (tool, args) in [
             (
@@ -263,7 +280,7 @@ mod tests {
                 "click",
                 json!({"scope": "window", "delivery_mode": "background"}),
             ),
-            ("drag", desktop_background),
+            ("move_cursor", desktop_background),
         ] {
             assert!(
                 enforce_delivery_target(tool, &args).is_ok(),

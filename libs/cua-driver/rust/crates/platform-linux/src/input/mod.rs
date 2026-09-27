@@ -42,6 +42,96 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 
+/// XWayland on Hyprland is not a native-seat target. These are the only
+/// same-desktop X11 background pointer operations we can address by exact
+/// compositor↔XID mapping without moving the primary X pointer/focus. Delivery
+/// is synthetic and many XI2 clients ignore it; callers must report an
+/// unverified effect, not promote this to a real-input compatibility claim.
+#[derive(Clone, Copy, Debug)]
+pub enum XWaylandBackgroundPointer {
+    Click {
+        x: i32,
+        y: i32,
+        button: u8,
+        count: usize,
+    },
+    Scroll {
+        x: i32,
+        y: i32,
+        button: u8,
+        ticks: usize,
+    },
+}
+
+/// Once the XSendEvent emitter starts, its first packet may have reached the
+/// X server before a later error. The caller must not replay automatically.
+#[derive(Debug)]
+pub struct XWaylandDispatchUnknown(pub String);
+
+impl std::fmt::Display for XWaylandDispatchUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "XWayland synthetic delivery is unknown: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for XWaylandDispatchUnknown {}
+
+pub fn send_xwayland_background_pointer(
+    pid: u32,
+    native_address: u64,
+    action: XWaylandBackgroundPointer,
+) -> Result<()> {
+    let (x, y, button, count) = match action {
+        XWaylandBackgroundPointer::Click {
+            x,
+            y,
+            button,
+            count,
+        } => {
+            anyhow::ensure!(
+                (1..=3).contains(&button) && (1..=2).contains(&count),
+                "XWayland click requires button 1..=3 and count 1..=2"
+            );
+            (x, y, button, count)
+        }
+        XWaylandBackgroundPointer::Scroll {
+            x,
+            y,
+            button,
+            ticks,
+        } => {
+            anyhow::ensure!(
+                (4..=7).contains(&button) && (1..=20).contains(&ticks),
+                "XWayland scroll requires wheel button 4..=7 and 1..=20 ticks"
+            );
+            (x, y, button, ticks)
+        }
+    };
+    let target = crate::x11::validate_hyprland_xwayland(pid, native_address)?;
+    send_click(u64::from(target.xid), x, y, count, button)
+        .map_err(|error| XWaylandDispatchUnknown(error.to_string()).into())
+}
+
+/// Background XSendEvent to one validated XWayland XID. Unlike the ordinary
+/// X11 helper, this never borrows/remaps a global X keycode on the host's
+/// shared X server. Keysyms absent from the existing map refuse before input.
+/// The client may still ignore synthetic events; success is not app outcome.
+pub fn send_xwayland_background_key(
+    pid: u32,
+    native_address: u64,
+    point: Option<(i32, i32)>,
+    key: &str,
+    modifiers: &[&str],
+) -> Result<()> {
+    let target = crate::x11::validate_hyprland_xwayland(pid, native_address)?;
+    send_key_to_target(u64::from(target.xid), point, key, modifiers, false)
+        .map_err(|error| XWaylandDispatchUnknown(error.to_string()).into())
+}
+
 const CLICK_DELAY_MS: u64 = 35;
 const DOUBLE_CLICK_DELAY_MS: u64 = 50;
 const KEY_DELAY_MS: u64 = 10;
@@ -3793,7 +3883,7 @@ pub fn send_drag_xtest_desktop(
 
 /// Send a named key press to a window.
 pub fn send_key(xid: u64, key: &str, modifiers: &[&str]) -> Result<()> {
-    send_key_to_target(xid, None, key, modifiers)
+    send_key_to_target(xid, None, key, modifiers, true)
 }
 
 /// Send a named key to the deepest child at window-local coordinates without
@@ -3801,7 +3891,7 @@ pub fn send_key(xid: u64, key: &str, modifiers: &[&str]) -> Result<()> {
 /// Chromium renderers receive the event on their input surface rather than on
 /// the native top-level wrapper.
 pub fn send_key_at(xid: u64, x: i32, y: i32, key: &str, modifiers: &[&str]) -> Result<()> {
-    send_key_to_target(xid, Some((x, y)), key, modifiers)
+    send_key_to_target(xid, Some((x, y)), key, modifiers, true)
 }
 
 fn send_key_to_target(
@@ -3809,6 +3899,7 @@ fn send_key_to_target(
     point: Option<(i32, i32)>,
     key: &str,
     modifiers: &[&str],
+    remap_allowed: bool,
 ) -> Result<()> {
     let (conn, _) = connect_x11_for_input()?;
     let target = point
@@ -3824,7 +3915,21 @@ fn send_key_to_target(
     // that restores the original mapping once the event has been delivered.
     let keysym = key_name_to_keysym(key)?;
     let mapping = conn.get_keyboard_mapping(8, 248)?.reply()?;
-    let (keycode, remap_guard) = keycode_for_keysym(&conn, &mapping, keysym, key)?;
+    let resolve = |keysym, key: &str| {
+        if remap_allowed {
+            keycode_for_keysym(&conn, &mapping, keysym, key)
+        } else {
+            char_to_keycode_shift(&mapping, keysym)
+                .map(|(keycode, _)| (keycode, None))
+                .ok_or_else(|| anyhow!("XWayland key '{key}' is absent from the base X keymap; refusing shared-server remap"))
+        }
+    };
+    let (keycode, remap_guard) = resolve(keysym, key)?;
+    let needs_shift = !remap_allowed
+        && char_to_keycode_shift(&mapping, keysym).is_some_and(|(_, shifted)| shifted)
+        && !modifiers
+            .iter()
+            .any(|modifier| modifier.eq_ignore_ascii_case("shift"));
 
     // XSendEvent's state mask describes modifiers for one key event, but does
     // not update Chromium's internal modifier state by itself. Emit the
@@ -3833,14 +3938,17 @@ fn send_key_to_target(
     // target window.
     let mut remap_guards = Vec::new();
     let mut modifier_keycodes = Vec::new();
-    for modifier in modifiers {
+    for modifier in modifiers
+        .iter()
+        .copied()
+        .chain(needs_shift.then_some("shift"))
+    {
         let modifier_keysym = key_name_to_keysym(modifier)?;
-        let (modifier_keycode, guard) =
-            keycode_for_keysym(&conn, &mapping, modifier_keysym, modifier)?;
+        let (modifier_keycode, guard) = resolve(modifier_keysym, modifier)?;
         if let Some(guard) = guard {
             remap_guards.push(guard);
         }
-        modifier_keycodes.push((modifier_keycode, modifiers_to_state(&[*modifier])));
+        modifier_keycodes.push((modifier_keycode, modifiers_to_state(&[modifier])));
     }
 
     let send_key_event = |response_type, detail, state, event_mask| {
@@ -4088,6 +4196,18 @@ fn remap_spare_keycode<'a>(
     })
 }
 
+fn existing_keycode(mapping: &GetKeyboardMappingReply, keysym: u32) -> Option<u8> {
+    let per = usize::from(mapping.keysyms_per_keycode);
+    if per == 0 {
+        return None;
+    }
+    mapping
+        .keysyms
+        .chunks(per)
+        .position(|syms| syms.contains(&keysym))
+        .and_then(|index| u8::try_from(8 + index).ok())
+}
+
 /// Resolve `keysym` to a keycode usable in a synthetic key event. First scans
 /// the existing keyboard mapping; if no keycode emits the keysym (common on
 /// sparse headless keymaps like a minimal Xwayland) it borrows a spare keycode
@@ -4099,13 +4219,8 @@ fn keycode_for_keysym<'a>(
     keysym: u32,
     key: &str,
 ) -> Result<(u8, Option<RemappedKeycode<'a>>)> {
-    let per = mapping.keysyms_per_keycode as usize;
-    if per > 0 {
-        for (i, syms) in mapping.keysyms.chunks(per).enumerate() {
-            if syms.iter().any(|&s| s == keysym) {
-                return Ok(((8 + i) as u8, None));
-            }
-        }
+    if let Some(keycode) = existing_keycode(mapping, keysym) {
+        return Ok((keycode, None));
     }
 
     // Not in the map — fall back to remapping a spare keycode (xdotool-style).
