@@ -32,9 +32,8 @@ lab_root="$(realpath -e /tmp/cua-omarchy-lab)"
 }
 HOME="$(realpath -e -- "$HOME")"
 XDG_RUNTIME_DIR="$(realpath -e -- "$XDG_RUNTIME_DIR")"
-[[ "$HOME" == "$lab_root/home" &&
-   ( "$XDG_RUNTIME_DIR" == /tmp/c || "$XDG_RUNTIME_DIR" == "$lab_root"/runtime* ) ]] || {
-  printf 'error: canonical HOME/runtime must be within the reviewed private lab\n' >&2
+[[ "$HOME" == "$lab_root/home" && "$XDG_RUNTIME_DIR" == /tmp/d ]] || {
+  printf 'error: candidate HOME and short private runtime must match the reviewed lab\n' >&2
   exit 1
 }
 for name in CONFIG CACHE DATA STATE; do
@@ -56,6 +55,14 @@ for private_dir in "$lab_root" "$HOME" "$XDG_RUNTIME_DIR" \
     exit 1
   }
 done
+# Hyprland appends a 40-hex revision and two decimal fields to its IPC path.
+# Reserve 19 digits for each field; sun_path has 108 bytes including the NUL.
+max_signature='ffffffffffffffffffffffffffffffffffffffff_9223372036854775807_9223372036854775807'
+socket2_path="$XDG_RUNTIME_DIR/hypr/$max_signature/.socket2.sock"
+(( ${#socket2_path} < 108 )) || {
+  printf 'error: private runtime is too long for Hyprland IPC sockets\n' >&2
+  exit 1
+}
 if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" &&
       "$DBUS_SESSION_BUS_ADDRESS" != unix:path=/tmp/dbus-* &&
       "$DBUS_SESSION_BUS_ADDRESS" != unix:path="$lab_root"/* ]]; then
