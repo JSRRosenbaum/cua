@@ -154,8 +154,11 @@ def input_status():
 
 
 def require_keyboard_capabilities(status):
-    if not (status.get("keyboard_layout_independent") is True and
-            status.get("foreground_numlock_compatible") is True):
+    capabilities = status.get("input")
+    if not (status.get("state") == "input_v3_candidate" and
+            isinstance(capabilities, dict) and capabilities.get("protocol") == 3 and
+            capabilities.get("keyboard_layout_independent") is True and
+            capabilities.get("foreground_numlock_compatible") is True):
         fail("mapped module lacks the independent-keymap/Num-Lock safety capabilities; "
              "install the matching patched module and use a fresh login")
 
@@ -197,7 +200,6 @@ def input_on(startup=False):
             if result.returncode:
                 fail("Cua plugin load failed; see Hyprland session logs: " + result.stderr.strip())
         mapped_module_current()
-        require_keyboard_capabilities(input_status())
         if not startup:
             FLAG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             if not FLAG.exists():
@@ -208,6 +210,7 @@ def input_on(startup=False):
         if result.returncode:
             fail("could not enable Cua plugin input: " + result.stderr.strip())
         status = input_status()
+        require_keyboard_capabilities(status)
         if status.get("configured") is not True or status.get("transport", {}).get("ready") is not True:
             fail("Cua input is not ready after activation; inspect hyprctl -j cua:status")
     except (RuntimeError, OSError, subprocess.SubprocessError):
