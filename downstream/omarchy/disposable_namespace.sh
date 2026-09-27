@@ -264,6 +264,18 @@ else
     shift 4
     mount --make-rprivate /
     mount -t tmpfs -o size=16m,mode=0700,nosuid,nodev tmpfs "$overlay_dir"
+    # The nested Wayland backend needs render nodes, not the host input seat.
+    # Hide all current and future evdev nodes in this private mount namespace.
+    [[ -d /dev/input && ! -L /dev/input &&
+       -c /dev/uinput && ! -L /dev/uinput ]] || {
+      printf "error: expected input device mountpoints are unavailable\n" >&2
+      exit 1
+    }
+    mount -t tmpfs -o size=64k,mode=000,nosuid,nodev,noexec tmpfs /dev/input
+    : > "$overlay_dir/blocked-uinput"
+    chmod 000 "$overlay_dir/blocked-uinput"
+    mount --bind "$overlay_dir/blocked-uinput" /dev/uinput
+    mount -o remount,bind,ro /dev/uinput
     for entry in "share:/usr/share" "bin:/usr/bin" "units:/usr/lib/systemd/user"; do
       name=${entry%%:*}
       directory=${entry#*:}

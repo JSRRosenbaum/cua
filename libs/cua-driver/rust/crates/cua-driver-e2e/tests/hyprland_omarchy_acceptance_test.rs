@@ -375,12 +375,7 @@ fn token(state: &ToolResponse, name: &str) -> String {
         .to_owned()
 }
 
-fn point(
-    driver: &mut McpDriver,
-    fixture: &Fixture,
-    state: &ToolResponse,
-    name: &str,
-) -> (f64, f64) {
+fn point(state: &ToolResponse, name: &str) -> (f64, f64) {
     let element = state.structured()["elements"]
         .as_array()
         .unwrap()
@@ -388,23 +383,11 @@ fn point(
         .find(|element| element["label"].as_str() == Some(name))
         .unwrap_or_else(|| panic!("missing native control: {name}"));
     let frame = &element["frame"];
-    let windows = driver.call("list_windows", json!({"pid": fixture.target.pid}));
-    let window = windows.structured()["windows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|window| window["window_id"].as_u64() == Some(fixture.target.native_id))
-        .unwrap();
     let width = state.structured()["screenshot_width"].as_f64().unwrap();
     let height = state.structured()["screenshot_height"].as_f64().unwrap();
-    let x = (frame["x"].as_f64().unwrap() + frame["w"].as_f64().unwrap() / 2.0
-        - window["x"].as_f64().unwrap())
-        * width
-        / window["width"].as_f64().unwrap();
-    let y = (frame["y"].as_f64().unwrap() + frame["h"].as_f64().unwrap() / 2.0
-        - window["y"].as_f64().unwrap())
-        * height
-        / window["height"].as_f64().unwrap();
+    // Element frames already use the exact screenshot's window-local pixels.
+    let x = frame["x"].as_f64().unwrap() + frame["w"].as_f64().unwrap() / 2.0;
+    let y = frame["y"].as_f64().unwrap() + frame["h"].as_f64().unwrap() / 2.0;
     assert!(
         x >= 0.0 && x < width && y >= 0.0 && y < height,
         "{name} lies outside captured exact target ({x},{y}) / ({width},{height})"
@@ -466,8 +449,6 @@ fn general_native_px_click_has_application_effect_and_continuous_primary_isolati
     )
     .expect("candidate Driver required");
     let target = launch(&mut driver, &dir, "Target");
-    let state = snapshot(&mut driver, &target);
-    let button = point(&mut driver, &target, &state, "native-activate");
     let sentinel = ForegroundSentinel::launch(&mut driver);
     sentinel
         .assert_guard_canaries(&mut driver, target.target)
@@ -477,6 +458,8 @@ fn general_native_px_click_has_application_effect_and_continuous_primary_isolati
         .prepare_background_observation(&mut driver, target.target)
         .unwrap();
     warp_return_negative_control(&dir);
+    let state = snapshot(&mut driver, &target);
+    let button = point(&state, "native-activate");
     let before = events(&target.journal).len();
     let original = cursor();
     let focused = focus();
@@ -646,7 +629,7 @@ fn screen_point(
     state: &ToolResponse,
     name: &str,
 ) -> (f64, f64) {
-    let (x, y) = point(driver, fixture, state, name);
+    let (x, y) = point(state, name);
     let window = guest_window_geometry(driver, fixture);
     (
         window["x"].as_f64().unwrap()
@@ -762,6 +745,15 @@ fn owned_xpra_intra_x11_xdnd_reaches_real_destination_application() {
         ],
     )
     .expect("candidate host Driver required");
+    let host_target = launch(&mut host, &dir, "Target");
+    let sentinel = ForegroundSentinel::launch(&mut host);
+    sentinel
+        .assert_guard_canaries(&mut host, host_target.target)
+        .expect("owned-session host sentinel canaries");
+    host.start_behavior_recording();
+    sentinel
+        .prepare_background_observation(&mut host, host_target.target)
+        .expect("owned-session host sentinel posture");
     let focused = focus();
     let cursor_before = cursor();
     let watch = PrimarySeatWatch::start(dir.join("owned-xpra-host-primary.json"));
@@ -793,115 +785,120 @@ fn owned_xpra_intra_x11_xdnd_reaches_real_destination_application() {
         .expect("private Xpra DISPLAY")
         .to_owned();
     let proof = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert_ne!(
-            private_socket,
-            std::env::var("CUA_DRIVER_SOCKET").unwrap_or_default(),
-            "never use a host Driver socket for owned X11 actions"
-        );
-        let mut guest =
-            McpDriver::spawn_daemon_proxy_named(&private_socket, "omarchy-private-xdnd")
-                .expect("private Xpra Driver must be reachable");
-        let source = guest_window(&mut guest, source_journal.clone(), "Source");
-        // Retained ownership must outlive an idle worker's ordinary keepalive;
-        // an expiring launch thread must not parent-death-kill the Xpra session.
-        let heartbeat_before_idle = events(&source.journal).len();
-        thread::sleep(Duration::from_secs(12));
-        assert!(
-            std::os::unix::net::UnixStream::connect(&private_socket).is_ok(),
-            "owned Driver vanished after launch worker became idle"
-        );
-        assert!(
-            events(&source.journal)[heartbeat_before_idle..]
-                .iter()
-                .any(|event| event["kind"] == "heartbeat"),
-            "owned GTK source died while Xpra should remain live"
-        );
-        activated_private_environment(
-            &private_socket,
-            &private_display,
-            &dir.join("owned-dbus-env.jsonl"),
-        );
-        let launched = guest.call(
-            "launch_app",
-            json!({
-                "launch_path": "/usr/bin/python3",
-                "additional_arguments": [script, "--actor", "Destination", "--journal",
-                                         destination_journal, "--x", "600", "--y", "50"],
-            }),
-        );
-        assert!(
-            !launched.is_error(),
-            "launch second app in SAME private DISPLAY: {}",
-            launched.text()
-        );
-        let destination = guest_window(&mut guest, destination_journal.clone(), "Destination");
-        assert_ne!(source.target.pid, destination.target.pid);
-        let source_frame = snapshot(&mut guest, &source);
-        let destination_frame = snapshot(&mut guest, &destination);
-        let from = screen_point(&mut guest, &source, &source_frame, "native-data-source");
-        let to = screen_point(
-            &mut guest,
-            &destination,
-            &destination_frame,
-            "native-data-destination",
-        );
-        let source_bounds = guest_window_geometry(&mut guest, &source);
-        let dest_bounds = guest_window_geometry(&mut guest, &destination);
-        assert!(
-            source_bounds["x"].as_f64().unwrap() + source_bounds["width"].as_f64().unwrap()
-                <= dest_bounds["x"].as_f64().unwrap(),
-            "owned source/destination must not overlap during actual XDND"
-        );
-        let desktop = guest.call("get_desktop_state", json!({}));
-        assert!(
-            !desktop.is_error(),
-            "private Xpra desktop capture: {}",
-            desktop.text()
-        );
-        let width = desktop.structured()["screen_width"].as_f64().unwrap();
-        let height = desktop.structured()["screen_height"].as_f64().unwrap();
-        for (x, y) in [from, to] {
-            assert!(
-                x >= 0.0 && y >= 0.0 && x < width && y < height,
-                "XDND endpoint must be on the private Xpra display"
-            );
-        }
-        guest.start_behavior_recording();
-        // Explicit desktop-scope XTest is a foreground gesture in the PRIVATE
-        // owned X server only. It is not a host foreground takeover or proof
-        // that existing XWayland windows admit a dual-target background route.
-        let dragged = guest.call(
-            "drag",
-            json!({
-                "scope": "desktop", "delivery_mode": "foreground",
-                "from_x": from.0, "from_y": from.1,
-                "to_x": to.0, "to_y": to.1, "duration_ms": 900, "steps": 45,
-            }),
-        );
-        assert!(
-            !dragged.is_error(),
-            "private Xpra desktop XDND gesture: {}",
-            dragged.text()
-        );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !events(&destination.journal).iter().any(|event| {
-            event["kind"] == "drop-received"
-                && event["accepted"] == true
-                && event["text"] == "Cua native cross-window data offer — 漢字"
-        }) {
-            assert!(
-                Instant::now() < deadline,
-                "destination app did not receive real XDND offer: {:?}",
-                events(&destination.journal)
-            );
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            events(&source.journal)
-                .iter()
-                .any(|event| event["kind"] == "offer-sent"),
-            "source did not offer GTK text/plain selection data"
-        );
+        sentinel
+            .observe_background(host_target.target, || {
+                assert_ne!(
+                    private_socket,
+                    std::env::var("CUA_DRIVER_SOCKET").unwrap_or_default(),
+                    "never use a host Driver socket for owned X11 actions"
+                );
+                let mut guest =
+                    McpDriver::spawn_daemon_proxy_named(&private_socket, "omarchy-private-xdnd")
+                        .expect("private Xpra Driver must be reachable");
+                let source = guest_window(&mut guest, source_journal.clone(), "Source");
+                // Retained ownership must outlive an idle worker's ordinary keepalive;
+                // an expiring launch thread must not parent-death-kill the Xpra session.
+                let heartbeat_before_idle = events(&source.journal).len();
+                thread::sleep(Duration::from_secs(12));
+                assert!(
+                    std::os::unix::net::UnixStream::connect(&private_socket).is_ok(),
+                    "owned Driver vanished after launch worker became idle"
+                );
+                assert!(
+                    events(&source.journal)[heartbeat_before_idle..]
+                        .iter()
+                        .any(|event| event["kind"] == "heartbeat"),
+                    "owned GTK source died while Xpra should remain live"
+                );
+                activated_private_environment(
+                    &private_socket,
+                    &private_display,
+                    &dir.join("owned-dbus-env.jsonl"),
+                );
+                let launched = guest.call(
+                    "launch_app",
+                    json!({
+                        "launch_path": "/usr/bin/python3",
+                        "additional_arguments": [script, "--actor", "Destination", "--journal",
+                                                 destination_journal, "--x", "600", "--y", "50"],
+                    }),
+                );
+                assert!(
+                    !launched.is_error(),
+                    "launch second app in SAME private DISPLAY: {}",
+                    launched.text()
+                );
+                let destination =
+                    guest_window(&mut guest, destination_journal.clone(), "Destination");
+                assert_ne!(source.target.pid, destination.target.pid);
+                let source_frame = snapshot(&mut guest, &source);
+                let destination_frame = snapshot(&mut guest, &destination);
+                let from = screen_point(&mut guest, &source, &source_frame, "native-data-source");
+                let to = screen_point(
+                    &mut guest,
+                    &destination,
+                    &destination_frame,
+                    "native-data-destination",
+                );
+                let source_bounds = guest_window_geometry(&mut guest, &source);
+                let dest_bounds = guest_window_geometry(&mut guest, &destination);
+                assert!(
+                    source_bounds["x"].as_f64().unwrap() + source_bounds["width"].as_f64().unwrap()
+                        <= dest_bounds["x"].as_f64().unwrap(),
+                    "owned source/destination must not overlap during actual XDND"
+                );
+                let desktop = guest.call("get_desktop_state", json!({}));
+                assert!(
+                    !desktop.is_error(),
+                    "private Xpra desktop capture: {}",
+                    desktop.text()
+                );
+                let width = desktop.structured()["screen_width"].as_f64().unwrap();
+                let height = desktop.structured()["screen_height"].as_f64().unwrap();
+                for (x, y) in [from, to] {
+                    assert!(
+                        x >= 0.0 && y >= 0.0 && x < width && y < height,
+                        "XDND endpoint must be on the private Xpra display"
+                    );
+                }
+                guest.start_behavior_recording();
+                // Explicit desktop-scope XTest is a foreground gesture in the PRIVATE
+                // owned X server only. It is not a host foreground takeover or proof
+                // that existing XWayland windows admit a dual-target background route.
+                let dragged = guest.call(
+                    "drag",
+                    json!({
+                        "scope": "desktop", "delivery_mode": "foreground",
+                        "from_x": from.0, "from_y": from.1,
+                        "to_x": to.0, "to_y": to.1, "duration_ms": 900, "steps": 45,
+                    }),
+                );
+                assert!(
+                    !dragged.is_error(),
+                    "private Xpra desktop XDND gesture: {}",
+                    dragged.text()
+                );
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !events(&destination.journal).iter().any(|event| {
+                    event["kind"] == "drop-received"
+                        && event["accepted"] == true
+                        && event["text"] == "Cua native cross-window data offer — 漢字"
+                }) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "destination app did not receive real XDND offer: {:?}",
+                        events(&destination.journal)
+                    );
+                    thread::sleep(Duration::from_millis(50));
+                }
+                assert!(
+                    events(&source.journal)
+                        .iter()
+                        .any(|event| event["kind"] == "offer-sent"),
+                    "source did not offer GTK text/plain selection data"
+                );
+            })
+            .expect("owned Xpra input must not reach the host sentinel")
     }));
     let stopped = host.call("stop_owned_session", json!({"id": owned_id}));
     let samples = watch.finish();
@@ -942,13 +939,8 @@ fn native_cross_client_transfer_has_actual_destination_state() {
         .unwrap();
     let source_frame = snapshot(&mut driver, &source);
     let destination_frame = snapshot(&mut driver, &destination);
-    let from = point(&mut driver, &source, &source_frame, "native-data-source");
-    let to = point(
-        &mut driver,
-        &destination,
-        &destination_frame,
-        "native-data-destination",
-    );
+    let from = point(&source_frame, "native-data-source");
+    let to = point(&destination_frame, "native-data-destination");
     let source_capture_id = source_frame.structured()["capture_id"]
         .as_str()
         .expect("source exact PNG binding");
@@ -1063,13 +1055,13 @@ fn certified_mode_refuses_unqualified_native_without_side_effects() {
     )
     .expect("candidate Driver required");
     let target = launch(&mut driver, &dir, "Target");
-    let state = snapshot(&mut driver, &target);
-    let button = point(&mut driver, &target, &state, "native-activate");
     let sentinel = ForegroundSentinel::launch(&mut driver);
     driver.start_behavior_recording();
     sentinel
         .prepare_background_observation(&mut driver, target.target)
         .unwrap();
+    let state = snapshot(&mut driver, &target);
+    let button = point(&state, "native-activate");
     let before = events(&target.journal).len();
     let original = cursor();
     let focused = focus();
@@ -1771,13 +1763,13 @@ fn native_popup_requires_exact_captured_surface_and_fresh_revision() {
     )
     .expect("candidate Driver required");
     let target = launch(&mut driver, &dir, "Target");
-    let state = snapshot(&mut driver, &target);
-    let anchor = point(&mut driver, &target, &state, "native-popup-anchor");
     let sentinel = ForegroundSentinel::launch(&mut driver);
     driver.start_behavior_recording();
     sentinel
         .prepare_background_observation(&mut driver, target.target)
         .unwrap();
+    let state = snapshot(&mut driver, &target);
+    let anchor = point(&state, "native-popup-anchor");
     let old = desktop_scene(&mut driver, &dir, "popup-closed");
     let before = events(&target.journal).len();
     let original_cursor = cursor();
