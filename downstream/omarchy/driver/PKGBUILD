@@ -41,6 +41,10 @@ prepare() {
 
 build() {
   _verify || return 1
+  [[ "${RUSTFLAGS:-}" == '-C force-frame-pointers=yes' ]] || {
+    printf 'error: makepkg Rust flags differ from reviewed Arch package default\n' >&2
+    return 1
+  }
   [[ ! -e "$srcdir/target" ]] || {
     printf 'error: retained Cargo target directory is not a fresh reviewed build\n' >&2
     return 1

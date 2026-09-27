@@ -20,6 +20,7 @@ ABI_PACKAGES = ("aquamarine", "glibc", "hyprcursor", "hyprgraphics", "hyprlang",
                 "hyprutils", "libgcc", "libstdc++", "libxkbcommon", "wayland")
 PLUGIN_OPTIONS = {"CUA_HYPRLAND_INPUT": "ON", "CUA_HYPRLAND_TEST_INPUT": "OFF",
                   "CUA_HYPRLAND_INPUT_TRACE": "OFF"}
+RUST_BUILD_FLAGS = "-C force-frame-pointers=yes"
 ROUTING_ENV = {"CPATH", "CPLUS_INCLUDE_PATH", "C_INCLUDE_PATH", "OBJC_INCLUDE_PATH",
                "GCC_EXEC_PREFIX", "COMPILER_PATH", "LIBRARY_PATH", "SDKROOT", "SYSROOT"}
 ROUTING_FLAGS = ("-I", "-L", "-B", "-isystem", "-iquote", "-idirafter",
@@ -267,6 +268,7 @@ def rust_toolchain():
     return {"rustc": command(str(rustc), "--version"),
             "cargo": command(str(cargo), "--version"),
             "rustup_toolchain": os.environ.get("RUSTUP_TOOLCHAIN", ""),
+            "rustflags": RUST_BUILD_FLAGS,
             "rustc_path": str(rustc), "cargo_path": str(cargo),
             "rustc_sha256": digest(rustc), "cargo_sha256": digest(cargo)}
 
@@ -312,6 +314,7 @@ def candidate_profile(compositor, stage, source, archive_bytes, stage_bytes, inv
                            "package_version": "0.56.2.cua." + revision[:12] + "-1",
                            "abi_hash": info["abiHash"], "binary_sha256": digest(binary),
                            "headers_sha256": headers_hash(headers),
+                           "hyprctl_sha256": digest(regular(stage / "usr/bin/hyprctl")),
                            "native_dependency_owners": native_owners,
                            "extra_dependencies": extra,
                            "pkgconfig_sha256": sha(plugin_pkgconfig(stage).encode()),
@@ -473,6 +476,11 @@ def verify_rust_environment(source_root, profile):
             "RUSTDOC", "RUSTDOCFLAGS", "CARGO")
         if name in ("CARGO_HOME", "CARGO_TARGET_DIR"):
             continue
+        require(name != "CARGO_ENCODED_RUSTFLAGS",
+                "encoded Cargo compiler flags override the reviewed Rust package flags")
+        if name == "RUSTFLAGS":
+            require(value in ("", RUST_BUILD_FLAGS), "unreviewed Rust package flags")
+            continue
         require(not value or not routed, f"Rust compiler/source routing refused: {name}")
     require(os.environ.get("RUSTC", "") == profile["driver_toolchain"]["rustc_path"] and
             rust_toolchain() == profile["driver_toolchain"],
@@ -531,6 +539,7 @@ def record_driver(kit, driver, output, extracted):
                   "cargo_sha256": profile["driver_toolchain"]["cargo_sha256"],
                   "rustc_path": profile["driver_toolchain"]["rustc_path"],
                   "cargo_path": profile["driver_toolchain"]["cargo_path"],
+                  "rustflags": profile["driver_toolchain"]["rustflags"],
                   "native_dependency_owners": native_owners}
     output.write_bytes(encoded(provenance))
     return provenance
@@ -583,6 +592,7 @@ def verify_consumer(kit, expected_kit_sha, binary, compositor_binary,
                 driver_build["cargo_sha256"] == profile["driver_toolchain"]["cargo_sha256"] and
                 driver_build["rustc_path"] == profile["driver_toolchain"]["rustc_path"] and
                 driver_build["cargo_path"] == profile["driver_toolchain"]["cargo_path"] and
+                driver_build["rustflags"] == profile["driver_toolchain"]["rustflags"] and
                 driver_build["native_dependency_owners"] ==
                 dependency_owners(driver, profile["stock"]["driver_dependencies"]) and
                 digest(regular(driver)) == driver_build["binary_sha256"] and
@@ -608,6 +618,17 @@ def prepare(args):
     archive_bytes = archive(files)
     stage_bytes, inventory = stage_archive(stage)
     profile = candidate_profile(compositor, stage, source, archive_bytes, stage_bytes, inventory)
+    integration_root = safe_dir(repo / "downstream/omarchy/integration")
+    integration_inputs = {
+        "PKGBUILD": regular(integration_root / "PKGBUILD").read_bytes(),
+        "cua-omarchy": regular(integration_root / "bin/cua-omarchy").read_bytes(),
+        "cua-driver-omarchy.service": regular(
+            integration_root / "systemd/cua-driver-omarchy.service").read_bytes(),
+        "cua-input.lua": regular(integration_root / "hypr/cua-input.lua").read_bytes(),
+        "menu-items.json": regular(integration_root / "omarchy/menu-items.json").read_bytes(),
+        "LICENSE.md": files["LICENSE.md"],
+    }
+    profile["integration"] = {"recipe_sha256": sha(integration_inputs["PKGBUILD"])}
     profile_bytes = encoded(profile)
     source_bytes = encoded(source)
     script_bytes = regular(__file__).read_bytes()
@@ -670,6 +691,10 @@ def prepare(args):
                     "HYPRLAND_LICENSE_SHA256": sha(license_bytes)}
     recipe = repo / "downstream/omarchy/compositor/PKGBUILD"
     (compositor_kit / "PKGBUILD").write_text(render(regular(recipe).read_text(), replacements))
+    integration_kit = output / "integration"
+    integration_kit.mkdir(parents=True, mode=0o700)
+    for name, data in integration_inputs.items():
+        (integration_kit / name).write_bytes(data)
     return profile
 
 

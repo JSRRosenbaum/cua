@@ -62,11 +62,16 @@ if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" &&
   printf 'error: host user-session bus must never enter a disposable candidate\n' >&2
   exit 1
 fi
-for name in usr/bin/Hyprland usr/bin/cua-driver \
+for name in usr/bin/Hyprland usr/bin/hyprctl usr/bin/cua-driver \
+            usr/bin/cua-omarchy \
             usr/lib/cua/hyprland/cua-hyprland-plugin.so \
+            usr/lib/systemd/user/cua-driver-omarchy.service \
             usr/share/cua-hyprland-plugin/KIT-PROVENANCE.json \
             usr/share/cua-driver-omarchy/BUILD-PROVENANCE.json \
             usr/share/cua-driver-omarchy/PROFILE.json \
+            usr/share/cua-omarchy/hypr/cua-input.lua \
+            usr/share/cua-omarchy/menu-items.json \
+            usr/share/licenses/cua-omarchy-integration/LICENSE.md \
             usr/share/hyprland-cua/PROFILE.json \
             usr/share/cua-hyprland-plugin/profile_verify.py; do
   [[ -f "$assembled/$name" && ! -L "$assembled/$name" ]] || {
@@ -94,6 +99,41 @@ python3 "$assembled/usr/share/cua-hyprland-plugin/profile_verify.py" verify-cons
   --compositor "$assembled/usr/bin/Hyprland" \
   --driver "$assembled/usr/bin/cua-driver" \
   --driver-provenance "$assembled/usr/share/cua-driver-omarchy/BUILD-PROVENANCE.json"
+python3 - "$assembled" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+profile = json.loads((root / "usr/share/cua-hyprland-plugin/PROFILE.json").read_text())
+recipe = root / "integration-kit/PKGBUILD"
+if not recipe.is_file() or recipe.is_symlink() or recipe.parent.is_symlink():
+    raise SystemExit("error: immutable integration kit recipe missing")
+digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+if digest(recipe) != profile["integration"]["recipe_sha256"]:
+    raise SystemExit("error: integration recipe differs from reviewed profile")
+match = re.search(r"(?ms)^sha256sums=\((.*?)\)", recipe.read_text())
+if not match or not re.fullmatch(r"\s*(?:'[0-9a-f]{64}'\s*){5}", match.group(1)):
+    raise SystemExit("error: integration recipe has no five literal SHA-256 pins")
+pins = re.findall(r"'([0-9a-f]{64})'", match.group(1))
+payloads = (
+    "usr/bin/cua-omarchy",
+    "usr/lib/systemd/user/cua-driver-omarchy.service",
+    "usr/share/cua-omarchy/hypr/cua-input.lua",
+    "usr/share/cua-omarchy/menu-items.json",
+    "usr/share/licenses/cua-omarchy-integration/LICENSE.md",
+)
+for name, expected in zip(payloads, pins, strict=True):
+    path = root / name
+    if not path.is_file() or path.is_symlink() or digest(path) != expected:
+        raise SystemExit(f"error: integration payload differs from pinned recipe: {name}")
+hyprctl = root / "usr/bin/hyprctl"
+if not hyprctl.is_file() or hyprctl.is_symlink() or \
+        digest(hyprctl) != profile["compositor"]["hyprctl_sha256"]:
+    raise SystemExit("error: hyprctl differs from reviewed compositor stage")
+PY
 
 display=''
 auth=''
@@ -130,12 +170,16 @@ if [[ -n "$join_pid" ]]; then
     printf 'error: selected PID/executable/display does not match candidate session\n' >&2
     exit 1
   }
-  for name in usr/bin/Hyprland usr/bin/cua-driver \
+  for name in usr/bin/Hyprland usr/bin/hyprctl usr/bin/cua-driver \
+              usr/bin/cua-omarchy \
               usr/lib/cua/hyprland/cua-hyprland-plugin.so \
+              usr/lib/systemd/user/cua-driver-omarchy.service \
               usr/share/cua-hyprland-plugin/PROFILE.json \
               usr/share/cua-hyprland-plugin/KIT-PROVENANCE.json \
               usr/share/cua-driver-omarchy/BUILD-PROVENANCE.json \
               usr/share/cua-driver-omarchy/PROFILE.json \
+              usr/share/cua-omarchy/hypr/cua-input.lua \
+              usr/share/cua-omarchy/menu-items.json \
               usr/share/hyprland-cua/PROFILE.json; do
     [[ "$(sha256sum "/proc/$join_pid/root/$name" | cut -d' ' -f1)" == \
        "$(sha256sum "$assembled/$name" | cut -d' ' -f1)" ]] || {
@@ -204,8 +248,8 @@ if [[ -n "$join_pid" ]]; then
     exec setpriv --reuid="$user" --regid="$group" --init-groups -- env -i "$@"
   ' bash "$uid" "$gid" "${session_env[@]}" "$@"
 else
-  # The host has no candidate Driver metadata mountpoint. An overlay on
-  # /usr/share preserves its existing resources without creating host files.
+  # Overlay only these directories in the private mount namespace. The host
+  # lacks candidate CLI/metadata/unit mountpoints; lowerdirs retain resources.
   overlay_dir="$(mktemp -d "$lab_root/.share-overlay.XXXXXXXX")"
   trap 'rmdir -- "$overlay_dir"' EXIT
   sudo -n unshare --mount --fork -- bash -ceu '
@@ -213,15 +257,26 @@ else
     shift 4
     mount --make-rprivate /
     mount -t tmpfs -o size=16m,mode=0700,nosuid,nodev tmpfs "$overlay_dir"
-    mkdir "$overlay_dir/upper" "$overlay_dir/work"
-    mount -t overlay overlay -o \
-      "lowerdir=/usr/share,upperdir=$overlay_dir/upper,workdir=$overlay_dir/work" /usr/share
-    for package_dir in cua-driver-omarchy hyprland-cua; do
+    for entry in "share:/usr/share" "bin:/usr/bin" "units:/usr/lib/systemd/user"; do
+      name=${entry%%:*}
+      directory=${entry#*:}
+      mkdir "$overlay_dir/$name.upper" "$overlay_dir/$name.work"
+      mount -t overlay overlay -o \
+        "lowerdir=$directory,upperdir=$overlay_dir/$name.upper,workdir=$overlay_dir/$name.work" \
+        "$directory"
+    done
+    for package_dir in cua-driver-omarchy hyprland-cua cua-omarchy; do
       mkdir -p "/usr/share/$package_dir"
       mount --bind "$assembled/usr/share/$package_dir" "/usr/share/$package_dir"
     done
     mount --bind "$assembled/usr/bin/Hyprland" /usr/bin/Hyprland
+    mount --bind "$assembled/usr/bin/hyprctl" /usr/bin/hyprctl
     mount --bind "$assembled/usr/bin/cua-driver" /usr/bin/cua-driver
+    : > /usr/bin/cua-omarchy
+    mount --bind "$assembled/usr/bin/cua-omarchy" /usr/bin/cua-omarchy
+    : > /usr/lib/systemd/user/cua-driver-omarchy.service
+    mount --bind "$assembled/usr/lib/systemd/user/cua-driver-omarchy.service" \
+      /usr/lib/systemd/user/cua-driver-omarchy.service
     mount --bind "$assembled/usr/lib/cua/hyprland/cua-hyprland-plugin.so" \
       /usr/lib/cua/hyprland/cua-hyprland-plugin.so
     mount --bind "$assembled/usr/share/cua-hyprland-plugin" /usr/share/cua-hyprland-plugin

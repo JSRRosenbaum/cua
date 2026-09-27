@@ -12,7 +12,7 @@ depends=(@COMPOSITOR_DEPENDS@ @ABI_DEPENDS@)
 makedepends=('python' 'binutils')
 conflicts=('hyprland')
 provides=('wayland-compositor' "hyprland=$pkgver-$pkgrel")
-options=('!strip' '!debug' '!lto')
+options=('!strip' '!debug' '!lto' '!zipman')
 source=('candidate-compositor.tar.gz' 'PROFILE.json' 'profile_verify.py' 'HYPRLAND-LICENSE')
 sha256sums=('@STAGE_SHA256@' '@PROFILE_SHA256@' '@VERIFIER_SHA256@' '@HYPRLAND_LICENSE_SHA256@')
 

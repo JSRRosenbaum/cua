@@ -16,3 +16,5 @@ harness-winui3/
 harness-webview/
 harness-electron/
 harness-tauri/
+harness-gtk3/
+harness-gtk4/
