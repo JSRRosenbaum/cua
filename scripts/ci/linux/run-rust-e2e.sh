@@ -53,6 +53,7 @@ export CUA_E2E_RESULTS_FILE="${RESULTS_FILE}"
 export CUA_E2E_RECORDINGS_ROOT="${RECORDING_ROOT}"
 export CUA_TEST_WORKSPACE_ROOT="${RUST_ROOT}"
 # Downstream qualification may select an already verified packaged Driver.
+PREBUILT_DRIVER="${CUA_TEST_DRIVER_BIN:-}"
 export CUA_TEST_DRIVER_BIN="${CUA_TEST_DRIVER_BIN:-${RUST_ROOT}/target/release/cua-driver}"
 export CUA_TEST_APPS_ROOT="${RUST_ROOT}/test-apps"
 export CUA_TEST_REQUIRE_FIXTURES=1
@@ -215,10 +216,17 @@ run_computer_history_gate() {
   export CUA_DRIVER_LOCAL_INSTALL_DIR="${history_bin_dir}"
   export XDG_STATE_HOME="${ARTIFACT_DIR}/history-state"
 
-  echo "[HISTORY] Installing the exact candidate into an isolated local namespace"
-  bash "${DRIVER_ROOT}/scripts/install-local.sh" --release \
-    2>&1 | tee "${ARTIFACT_DIR}/history-install-local.log"
-  export CUA_E2E_INSTALLED_DRIVER_BIN="${history_home}/packages/current/cua-driver-local"
+  if [[ -n "${PREBUILT_DRIVER}" ]]; then
+    # The preflight validates this caller-selected installed candidate. Do not
+    # replace it with a fresh source build for the real GUI history scenario.
+    echo "[HISTORY] Using selected installed candidate: ${CUA_TEST_DRIVER_BIN}"
+    export CUA_E2E_INSTALLED_DRIVER_BIN="${CUA_TEST_DRIVER_BIN}"
+  else
+    echo "[HISTORY] Installing the exact candidate into an isolated local namespace"
+    bash "${DRIVER_ROOT}/scripts/install-local.sh" --release \
+      2>&1 | tee "${ARTIFACT_DIR}/history-install-local.log"
+    export CUA_E2E_INSTALLED_DRIVER_BIN="${history_home}/packages/current/cua-driver-local"
+  fi
   export CUA_E2E_HISTORY_DAEMON_SOCKET="${history_socket}"
   if [[ ! -x "${CUA_E2E_INSTALLED_DRIVER_BIN}" ]]; then
     echo "installed history driver is missing: ${CUA_E2E_INSTALLED_DRIVER_BIN}" >&2
