@@ -227,6 +227,54 @@ pub(super) fn activate(
 }
 
 #[cfg(target_os = "linux")]
+struct CapturedDesktopFrame {
+    origin: Point,
+    image_scale: Point,
+    capture_id: String,
+}
+
+#[cfg(target_os = "linux")]
+impl CapturedDesktopFrame {
+    fn from_state(state: &serde_json::Value) -> Result<Self, String> {
+        let origin = &state["scene"]["frame_origin"];
+        let [Some(x), Some(y)] =
+            ["x", "y"].map(|axis| origin[axis].as_f64().filter(|value| value.is_finite()))
+        else {
+            return Err("Hyprland capture has no finite desktop frame origin".into());
+        };
+        let [Some(width), Some(height), Some(image_width), Some(image_height)] = [
+            "screen_width",
+            "screen_height",
+            "screenshot_width",
+            "screenshot_height",
+        ]
+        .map(|key| {
+            state[key]
+                .as_f64()
+                .filter(|value| value.is_finite() && *value > 0.0)
+        }) else {
+            return Err("Hyprland capture has invalid desktop frame dimensions".into());
+        };
+        let capture_id = state["capture_id"]
+            .as_str()
+            .ok_or("Hyprland capture has no capture identity")?
+            .to_owned();
+        Ok(Self {
+            origin: (x, y),
+            image_scale: (image_width / width, image_height / height),
+            capture_id,
+        })
+    }
+
+    fn image_point(&self, layout: Point) -> Point {
+        (
+            (layout.0 - self.origin.0) * self.image_scale.0,
+            (layout.1 - self.origin.1) * self.image_scale.1,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn calibrate(
     driver: &mut impl crate::Driver,
     target: crate::observer::TargetWindow,
@@ -234,6 +282,7 @@ pub(super) fn calibrate(
     struct NativeIo<'a, D> {
         driver: &'a mut D,
         target: crate::observer::TargetWindow,
+        frame: Option<CapturedDesktopFrame>,
     }
     impl<D: crate::Driver> CalibrationIo for NativeIo<'_, D> {
         fn snapshot(&mut self) -> Result<DesktopSnapshot, String> {
@@ -247,6 +296,7 @@ pub(super) fn calibrate(
                     state.text()
                 ));
             }
+            self.frame = Some(CapturedDesktopFrame::from_state(&state.structured())?);
             let snapshot = DesktopObserver::new(NativeObserver::new(), self.target)
                 .snapshot()
                 .map_err(|error| error.to_string())?;
@@ -261,10 +311,15 @@ pub(super) fn calibrate(
             crate::observer::linux::hyprland_monitor_regions().map_err(|error| error.to_string())
         }
         fn move_cursor(&mut self, point: Point) -> Result<(), String> {
+            let frame = self.frame.as_ref().ok_or("missing fresh desktop capture")?;
+            // Only the actuator uses Driver's screenshot frame. The canary
+            // destination and post-action oracle remain compositor-logical.
+            let image = frame.image_point(point);
             let response = self.driver.call(
                 "move_cursor",
                 serde_json::json!({
-                    "x": point.0, "y": point.1, "scope": "desktop",
+                    "x": image.0, "y": image.1, "scope": "desktop",
+                    "capture_id": frame.capture_id,
                 }),
             );
             if response.is_error() {
@@ -281,13 +336,34 @@ pub(super) fn calibrate(
             activate(self.driver, self.target)
         }
     }
-    calibrate_io(&mut NativeIo { driver, target })
+    calibrate_io(&mut NativeIo {
+        driver,
+        target,
+        frame: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_coordinates_preserve_negative_origins_and_capped_image_axes() {
+        let frame = CapturedDesktopFrame::from_state(&serde_json::json!({
+            "scene": {"frame_origin": {"x": -1280, "y": -240}},
+            "screen_width": 2780, "screen_height": 1200,
+            "screenshot_width": 1390, "screenshot_height": 601,
+            "capture_id": "captured-desktop",
+        }))
+        .unwrap();
+        let image = frame.image_point((-960.0, 360.0));
+        assert_eq!(image.0, 160.0);
+        assert!((image.1 - 300.5).abs() < 1e-9);
+        // Out-of-frame points remain invalid; never clamp into an output.
+        assert_eq!(frame.image_point((-1320.0, -240.0)), (-20.0, 0.0));
+    }
 
     #[test]
     fn focus_canary_accepts_only_expected_transfer() {
